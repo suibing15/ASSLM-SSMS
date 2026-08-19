@@ -69,36 +69,31 @@ async function loadClasses() {
 async function loadStudents() {
   if (!currentClass) return alert('Select class first');
 
-  const pwd = document.getElementById('classPassword').value.trim();
-  if (!pwd) return alert('Enter class password');
-
-  // Verify password first via mark endpoint (light check)
-  const verify = await fetch('/api/attendance/mark', {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      classId: currentClass,
-      classPassword: pwd,
-      students: {}
-    })
-  });
-
-  if (verify.status === 401) {
-    return alert('Invalid class password');
-  }
-
-  if (verify.status === 400) {
-    // ignore duplicate message, we only used it for verification
-  }
-
-  // Now fetch students
+  // Fetching the student list itself never needs the class password —
+  // your own backend already only requires the teacher's own login
+  // session for this. The class password is only ever needed at
+  // actual submission time, in submitAttendance() below.
+  //
+  // This used to "verify" the password first by submitting a FAKE
+  // attendance record with an empty student list to the real
+  // submission endpoint — which is a genuine problem on two counts:
+  // an empty list there means every student gets marked absent, so
+  // simply trying to unlock a class could silently overwrite real
+  // attendance with an all-absent placeholder as a side effect. It
+  // also only ever checked for a 401 or 400 response and silently
+  // continued for anything else (already-submitted-today, a network
+  // hiccup, anything), which is very likely why students sometimes
+  // never appeared with no clear error at all.
   const res = await fetch(`/api/attendance/class/${currentClass}/students`, {
     credentials: 'include'
   });
 
+  if (res.status === 401) {
+    return alert('Your session has expired — please log in again.');
+  }
   if (!res.ok) {
-    return alert('Failed to load students');
+    const e = await res.json().catch(() => ({}));
+    return alert(e.error || 'Failed to load students.');
   }
 
   const data = await res.json();
