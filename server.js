@@ -306,15 +306,10 @@ const studentBulkUpload = multer({
   { name: 'photos', maxCount: 200 }
 ]);
 
-// Question image upload
+// Question image upload — memory only, uploaded to Supabase Storage
+// by the route below.
 const questionUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, QUESTION_IMAGE_DIR),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname) || '.png';
-      cb(null, `question_${Date.now()}${ext}`);
-    }
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
@@ -334,25 +329,7 @@ const BRANDING_UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(BRANDING_UPLOAD_DIR)) fs.mkdirSync(BRANDING_UPLOAD_DIR, { recursive: true });
 
 const brandingUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, BRANDING_UPLOAD_DIR),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname) || '.png';
-      // Read the type from the URL query string (?type=principal), NOT
-      // req.body. Multer's filename callback fires while the upload
-      // stream is still being read, before the rest of the form's text
-      // fields have necessarily arrived — so req.body.type is often
-      // still undefined at this exact moment, silently defaulting every
-      // upload to "logo" and overwriting the wrong file. A query
-      // parameter is parsed from the URL immediately, before any of the
-      // body is read, so it's always reliably available here.
-      const type = (req.query.type || 'logo').replace(/[^a-z0-9_-]/gi, '');
-      // One fixed filename per type (logo.png, principal.png, formmaster.png).
-      // Re-uploading the same type overwrites the old file directly,
-      // no orphaned files, no path mismatch, no naming conflicts.
-      cb(null, `${type}${ext}`);
-    }
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
@@ -370,6 +347,7 @@ const brandingUpload = multer({
 const { generateQuestionPDF } = require("./utils/questionPdfGenerator");
 const reportGuard = require("./middleware/reportGuard");
 const { readData, writeData, updateData } = require("./utils/dataStore");
+const { uploadBuffer, uploadLocalFileAndCleanup, tempPdfPath, deleteFromStorage, resolveImageForGeneration, withResolvedImages, withResolvedImagesForMany, withResolvedFieldForMany } = require("./utils/storage");
 const { requireActiveSchool, startRegistryHeartbeat } = require("./utils/registryCheck");
 const { generateExamPDF, generateConsolidatedResultPDF } = require("./utils/pdfGenerator");
 const { generateReportPDF } = require("./utils/reportGenerator");
@@ -942,47 +920,45 @@ app.get('/api/admin/pdfs', (req, res) => {
 });
 
 // ----------------------------- UPLOAD LOGO / SIGNATURE -----------------------------
-app.post('/api/admin/upload', brandingUpload, (req, res) => {
+app.post('/api/admin/upload', brandingUpload, async (req, res) => {
   if (!req.session.admin)
     return res.status(401).json({ error: 'Unauthorized' });
 
   if (!req.file)
     return res.status(400).json({ error: 'No image uploaded' });
 
-  const relPath = `/uploads/${req.file.filename}`;
-
   try {
-    const data = readData();
-    data.meta ||= {};
-
-    // Prefer the type sent as a URL query parameter (reliable — see the
-    // comment on brandingUpload above for why req.body.type isn't safe
-    // here). Still checks req.body.type too for any older callers, then
-    // falls back to guessing from the filename as a last resort.
+    // Prefer the type sent as a URL query parameter (reliable — a text
+    // form field can lag behind the file itself arriving). Still checks
+    // req.body.type too for any older callers, then falls back to
+    // guessing from the filename as a last resort.
     const explicitType = (req.query.type || req.body.type || "").toLowerCase();
     const lower = req.file.originalname.toLowerCase();
 
-    if (explicitType === "principal" || (!explicitType && lower.includes('principal'))) {
-      data.meta.signaturePrincipal = relPath;
-    } else if (explicitType === "formmaster" || (!explicitType && lower.includes('form'))) {
-      data.meta.signatureFormMaster = relPath;
-    } else if (explicitType === "logo" || !explicitType) {
-      data.meta.logo = relPath;
-    }
+    let type = "logo";
+    if (explicitType === "principal" || (!explicitType && lower.includes('principal'))) type = "principal";
+    else if (explicitType === "formmaster" || (!explicitType && lower.includes('form'))) type = "formmaster";
 
-    writeData(data, ['settings'])
-      .then(() => res.json({ success: true, path: relPath }))
-      .catch(err => {
-        console.error('upload writeData error:', err);
-        res.status(500).json({ error: 'Failed to save upload metadata' });
-      });
+    const ext = path.extname(req.file.originalname) || '.png';
+    // Uploaded to Supabase Storage now, not local disk — this is what
+    // actually survives a redeploy or a restart on a host with no
+    // persistent disk, which local disk never did.
+    const publicUrl = await uploadBuffer(`branding/${type}${ext}`, req.file.buffer, req.file.mimetype);
+
+    const data = readData();
+    data.meta ||= {};
+    if (type === "principal") data.meta.signaturePrincipal = publicUrl;
+    else if (type === "formmaster") data.meta.signatureFormMaster = publicUrl;
+    else data.meta.logo = publicUrl;
+
+    await writeData(data, ['settings']);
+    res.json({ success: true, path: publicUrl });
 
   } catch (err) {
     console.error('/api/admin/upload error:', err);
-    res.status(500).json({ error: 'Upload failed' });
+    res.status(500).json({ error: 'Upload failed', details: err.message });
   }
 });
-
 
 
 // ----------------------------- ADD SUBJECT (class-wise only) -----------------------------
@@ -1092,7 +1068,7 @@ app.delete(['/api/admin/subject/:id/:classId', '/api/admin/subject/:id'], (req, 
 
 // ----------------------------- ADD QUESTION -----------------------------
 app.post("/api/admin/question", (req, res) => {
-  questionUpload(req, res, err => {
+  questionUpload(req, res, async err => {
     if (err) {
       console.error("Image upload error:", err);
       return res.status(500).json({ error: "Image upload failed" });
@@ -1130,23 +1106,26 @@ app.post("/api/admin/question", (req, res) => {
           .filter(Boolean);
       }
 
+      let imageUrl = null;
+      if (req.file) {
+        const ext = path.extname(req.file.originalname) || '.png';
+        const safeQid = String(qid).replace(/[^a-zA-Z0-9_-]/g, '_');
+        // Uploaded to Supabase Storage — survives a redeploy or
+        // restart, which local disk never did.
+        imageUrl = await uploadBuffer(`questions/${safeQid}${ext}`, req.file.buffer, req.file.mimetype);
+      }
+
       subj.questions[type].push({
         qid,
         text,
         options: parsedOptions,
         answer: answer || "",
         marks: sanitizeQuestionMarks(marks),
-        image: req.file ? `/uploads/${req.file.filename}` : null
+        image: imageUrl
       });
 
-      writeData(data, ['questions'])
-        .then(() =>
-          res.json({
-            success: true,
-            message: "Question added successfully"
-          })
-        )
-        .catch(() => res.status(500).json({ error: "Write failed" }));
+      await writeData(data, ['questions']);
+      res.json({ success: true, message: "Question added successfully" });
     } catch (e) {
       console.error(e);
       res.status(500).json({ error: "Internal error" });
@@ -1176,26 +1155,31 @@ app.get("/api/admin/questions/pdf", async (req, res) => {
     if (!questions.length)
       return res.status(400).json({ error: "No questions available" });
 
-    const outputDir = path.join(__dirname, "public/question-pdfs");
-    if (!fs.existsSync(outputDir))
-      fs.mkdirSync(outputDir, { recursive: true });
-
     const fileName = `${classId}_${subjectId}_${normalizedType}.pdf`;
-    const outputPath = path.join(outputDir, fileName);
+    const localPath = tempPdfPath(fileName);
+
+    // The school's logo and each question's own image are Supabase
+    // URLs now — resolved to local temp files first, generateQuestionPDF
+    // itself is completely unchanged.
+    const logoResolved = await withResolvedImages(data.meta || {});
+    const questionsResolved = await withResolvedFieldForMany(questions, "image");
 
     await generateQuestionPDF(
       {
-        ...(data.meta || {}), // real school branding: schoolName, address, motto, phone, logo, etc.
+        ...logoResolved.meta, // real school branding: schoolName, address, motto, phone, logo, etc.
         className: classId,
         subjectName: subj.name,
         type: normalizedType,
         term: data.meta?.term
       },
-      questions,
-      outputPath
+      questionsResolved.items,
+      localPath
     );
+    logoResolved.cleanup();
+    questionsResolved.cleanup();
 
-    res.json({ success: true, file: `/question-pdfs/${fileName}` });
+    const relPath = await uploadLocalFileAndCleanup(localPath, `question-papers/${classId}_${subjectId}_${normalizedType}.pdf`);
+    res.json({ success: true, file: relPath });
   } catch (err) {
     console.error("Question PDF error:", err);
     res.status(500).json({ error: "Failed to generate PDF" });
@@ -1257,7 +1241,7 @@ app.post("/api/admin/questions/forward", (req, res) => {
 
 
 // -------------------- BULK CSV UPLOAD --------------------
-app.post('/api/admin/questions/bulk-upload', csvUpload, (req, res) => {
+app.post('/api/admin/questions/bulk-upload', csvUpload, async (req, res) => {
   if (!req.session.admin)
     return res.status(401).json({ error: 'Unauthorized' });
 
@@ -1291,11 +1275,16 @@ app.post('/api/admin/questions/bulk-upload', csvUpload, (req, res) => {
     let skipped = 0;
     let imagesAttached = 0;
 
-    rows.forEach(rawRow => {
+    // Was `.forEach`, which silently ignores `await` inside its
+    // callback — every image upload would have fired without ever
+    // actually being waited for, meaning the write below could run
+    // before any of them finished. A real for-of loop actually
+    // pauses for each upload, in order.
+    for (const rawRow of rows) {
       const r = mapBulkQuestionRow(rawRow);
       const type = String(r.type || '').toLowerCase().trim();
 
-      if (!subj.questions[type]) { skipped++; return; }
+      if (!subj.questions[type]) { skipped++; continue; }
 
       const options = String(r.options || '')
         .split(',')
@@ -1313,9 +1302,9 @@ app.post('/api/admin/questions/bulk-upload', csvUpload, (req, res) => {
         if (match) {
           const ext = path.extname(match.originalname) || '.png';
           const safeQid = String(r.qid || `Q${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '_');
-          const savedName = `question_${safeQid}${ext}`;
-          fs.writeFileSync(path.join(QUESTION_IMAGE_DIR, savedName), match.buffer);
-          imagePath = `/uploads/${savedName}`;
+          // Uploaded to Supabase Storage — survives a redeploy or
+          // restart, which local disk never did.
+          imagePath = await uploadBuffer(`questions/${safeQid}${ext}`, match.buffer, match.mimetype);
           unmatchedImageNames.delete(wantedName);
           imagesAttached++;
         }
@@ -1330,7 +1319,7 @@ app.post('/api/admin/questions/bulk-upload', csvUpload, (req, res) => {
         image: imagePath
       });
       added++;
-    });
+    }
 
     if (!added) {
       return res.status(400).json({
@@ -1338,13 +1327,14 @@ app.post('/api/admin/questions/bulk-upload', csvUpload, (req, res) => {
       });
     }
 
-    writeData(data, ['questions']).then(() => res.json({
+    await writeData(data, ['questions']);
+    res.json({
       success: true,
       added,
       skipped,
       imagesAttached,
       unmatchedImages: Array.from(unmatchedImageNames) // uploaded but no row referenced them — worth telling the admin
-    }));
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Bulk upload failed: ' + err.message });
@@ -1516,29 +1506,15 @@ app.delete("/api/admin/class/:id", (req, res) => {
 
 // ---------------- STUDENT CRUD ----------------
 
-// ✅ Ensure upload directory exists
-const uploadDir = path.join(__dirname, "public", "images");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// ✅ Configure multer storage (for photo uploads)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || ".jpg";
-    cb(null, `student_${Date.now()}${ext}`);
-  },
-});
-
-// ✅ Safely create or reuse upload instance
+// ✅ Configure multer for photo uploads — memory only now, uploaded
+// to Supabase Storage by each route below rather than written to
+// local disk (which never survives a redeploy or restart without a
+// persistent disk attached).
 let uploadInstance;
 try {
-  uploadInstance = global.upload || multer({ storage });
+  uploadInstance = global.upload || multer({ storage: multer.memoryStorage() });
 } catch (err) {
-  uploadInstance = multer({ storage });
+  uploadInstance = multer({ storage: multer.memoryStorage() });
 }
 global.upload = uploadInstance;
 
@@ -1582,7 +1558,8 @@ app.post("/api/admin/student", studentUpload, async (req, res) => {
 
     let photoPath = null;
     if (req.file) {
-      photoPath = path.relative(__dirname, req.file.path).replace(/\\/g, "/");
+      const ext = path.extname(req.file.originalname) || ".jpg";
+      photoPath = await uploadBuffer(`students/${id}${ext}`, req.file.buffer, req.file.mimetype);
     }
 
     const plainPassword = password || id; // shown once, in this response only
@@ -1681,9 +1658,7 @@ app.post("/api/admin/students/bulk-upload", studentBulkUpload, async (req, res) 
         if (match) {
           const ext = path.extname(match.originalname) || ".jpg";
           const safeId = id.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const savedName = `student_${safeId}${ext}`;
-          fs.writeFileSync(path.join(uploadDir, savedName), match.buffer);
-          photoPath = path.relative(__dirname, path.join(uploadDir, savedName)).replace(/\\/g, "/");
+          photoPath = await uploadBuffer(`students/${safeId}${ext}`, match.buffer, match.mimetype);
           unmatchedPhotoNames.delete(wantedName);
           imagesAttached++;
         }
@@ -1751,7 +1726,8 @@ app.put("/api/admin/student/:id", studentUpload, async (req, res) => {
     }
 
     if (req.file) {
-      st.photo = path.relative(__dirname, req.file.path).replace(/\\/g, "/");
+      const ext = path.extname(req.file.originalname) || ".jpg";
+      st.photo = await uploadBuffer(`students/${st.id}${ext}`, req.file.buffer, req.file.mimetype);
     }
 
     writeData(data, ['students'])
@@ -1922,7 +1898,8 @@ app.post("/api/admin/teacher", teacherUpload, async (req, res) => {
 
     let photoPath = null;
     if (req.file) {
-      photoPath = path.relative(__dirname, req.file.path).replace(/\\/g, "/");
+      const ext = path.extname(req.file.originalname) || ".jpg";
+      photoPath = await uploadBuffer(`teachers/${id}${ext}`, req.file.buffer, req.file.mimetype);
     }
 
     const hashedPassword = await bcrypt.hash(String(password), 10);
@@ -2030,7 +2007,7 @@ app.post("/api/admin/logout", (req, res) => {
 });
 
 /* ========= CLASS PDF ========= */
-app.get("/api/admin/attendance/class/:id/pdf", (req, res) => {
+app.get("/api/admin/attendance/class/:id/pdf", async (req, res) => {
   if (!req.session.admin)
     return res.status(401).json({ error: "Unauthorized" });
 
@@ -2051,23 +2028,30 @@ app.get("/api/admin/attendance/class/:id/pdf", (req, res) => {
     day.teacherName = teacherById[day.teacherId] || day.teacherId || "Unknown";
   });
 
-  const outDir = path.join(__dirname, "public/reports");
-  fs.mkdirSync(outDir, { recursive: true });
-
   const file = `ATTENDANCE_${cls.id}.pdf`;
-  const outPath = path.join(outDir, file);
+  const localPath = tempPdfPath(file);
 
-  generateClassAttendancePDF({
-    meta: data.meta,
-    cls,
-    students,
-    attendance,
-    fromDate: from,
-    toDate: to,
-    outPath
-  });
+  // data.meta.logo is a Supabase Storage URL now — resolved to a
+  // local temp file first, generateClassAttendancePDF itself is
+  // completely unchanged.
+  const logoResolved = await withResolvedImages(data.meta);
 
-  res.json({ file: `/reports/${file}` });
+  try {
+    await generateClassAttendancePDF({
+      meta: logoResolved.meta,
+      cls,
+      students,
+      attendance,
+      fromDate: from,
+      toDate: to,
+      outPath: localPath
+    });
+  } finally {
+    logoResolved.cleanup();
+  }
+
+  const relPath = await uploadLocalFileAndCleanup(localPath, `attendance/${cls.id}/${file}`);
+  res.json({ file: relPath });
 });
 
 /* ========= TEACHER PDF ========= */
@@ -2079,26 +2063,33 @@ app.get("/api/admin/attendance/teachers/pdf", async (req, res) => {
     const { from, to } = req.query;
     const data = readData();
 
-    const outDir = path.join(__dirname, "public/reports");
-    fs.mkdirSync(outDir, { recursive: true });
-
     const file = "TEACHER_ATTENDANCE.pdf";
-    const outPath = path.join(outDir, file);
+    const localPath = tempPdfPath(file);
+
+    // data.meta.logo is a Supabase Storage URL now — resolved to a
+    // local temp file first, generateTeacherAttendancePDF itself is
+    // completely unchanged.
+    const logoResolved = await withResolvedImages(data.meta);
 
     // Uses each teacher's own login-based attendance record, not the
     // class-attendance object — those track different things (who
     // signed a class in, versus whether the teacher themselves was
     // present that day).
-    await generateTeacherAttendancePDF({
-      meta: data.meta,
-      teachers: data.teachers || [],
-      teacherAttendance: data.teacherAttendance || {},
-      fromDate: from,
-      toDate: to,
-      outPath
-    });
+    try {
+      await generateTeacherAttendancePDF({
+        meta: logoResolved.meta,
+        teachers: data.teachers || [],
+        teacherAttendance: data.teacherAttendance || {},
+        fromDate: from,
+        toDate: to,
+        outPath: localPath
+      });
+    } finally {
+      logoResolved.cleanup();
+    }
 
-    res.json({ file: `/reports/${file}` });
+    const relPath = await uploadLocalFileAndCleanup(localPath, `attendance/${file}`);
+    res.json({ file: relPath });
   } catch (err) {
     console.error("Teacher attendance PDF error:", err);
     res.status(500).json({ error: "Failed to generate teacher attendance PDF" });
@@ -2245,21 +2236,25 @@ app.post("/api/admin/teacher/:teacherId/idcard", async (req, res) => {
     const teacher = (data.teachers || []).find(t => t.id === req.params.teacherId);
     if (!teacher) return res.status(404).json({ error: "Teacher not found" });
 
-    const outputDir = path.join(__dirname, "public/idcards");
-    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
     // Teacher IDs at this school can contain slashes (e.g. "ASLM/P/01"),
     // which Node would otherwise read as a folder separator, causing the
     // file write to fail outright since that subfolder doesn't exist.
     const safeId = String(teacher.id).replace(/[\/\\]/g, "_");
-    const outputPath = path.join(outputDir, `teacher_${safeId}.pdf`);
+    const outputPath = tempPdfPath(`teacher_${safeId}.pdf`);
 
+    // Generated fresh and streamed straight back — no Storage upload
+    // needed, same reasoning as the other ID card routes above.
+    const resolved = await withResolvedImages(data.meta || {}, teacher);
     const { generateTeacherIDCard } = require("./utils/idCardGenerator");
-    await generateTeacherIDCard(teacher, data.meta || {}, outputPath);
+    await generateTeacherIDCard(resolved.student, resolved.meta, outputPath);
+    resolved.cleanup();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename=teacher_${safeId}.pdf`);
-    return res.sendFile(outputPath);
+    res.sendFile(outputPath, (err) => {
+      fs.unlink(outputPath, () => {});
+      if (err) console.error("Error streaming teacher ID card:", err.message);
+    });
   } catch (err) {
     console.error("Teacher ID card error:", err);
     res.status(500).json({ error: "Failed to generate teacher ID card" });
@@ -2281,24 +2276,26 @@ app.post("/api/admin/idcard/:studentId", async (req, res) => {
     if (!student)
       return res.status(404).json({ error: "Student not found" });
 
-    const outputDir = path.join(__dirname, "public/idcards");
-    if (!fs.existsSync(outputDir))
-      fs.mkdirSync(outputDir, { recursive: true });
-
     const sid = String(student.id || student.studentId).replace(/[\/\\]/g, "_");
-    const outputPath = path.join(outputDir, `${sid}.pdf`);
+    const outputPath = tempPdfPath(`${sid}.pdf`);
 
+    // This card is generated fresh and streamed straight back for
+    // this one request — it never needs to persist afterward, so no
+    // Storage upload here, just a temp file cleaned up once sent. The
+    // student's photo and the school's logo are Supabase URLs now,
+    // resolved to local temp files first so generateIDCard (kept
+    // completely unchanged) keeps working exactly as it always has.
+    const resolved = await withResolvedImages(data.meta || {}, student);
     const { generateIDCard } = require("./utils/idCardGenerator");
-    await generateIDCard(student, data.meta || {}, outputPath, req.body.plainPassword);
+    await generateIDCard(resolved.student, resolved.meta, outputPath, req.body.plainPassword);
+    resolved.cleanup();
 
-    // ✅ Stream file directly to browser
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename=${sid}.pdf`
-    );
-
-    return res.sendFile(outputPath);
+    res.setHeader("Content-Disposition", `inline; filename=${sid}.pdf`);
+    res.sendFile(outputPath, (err) => {
+      fs.unlink(outputPath, () => {}); // best-effort cleanup either way
+      if (err) console.error("Error streaming ID card:", err.message);
+    });
 
   } catch (err) {
     console.error("❌ Single ID card error:", err);
@@ -2338,24 +2335,22 @@ app.post("/api/admin/idcards/class/:classId", async (req, res) => {
       });
     }
 
-    const outputDir = path.join(__dirname, "public/idcards");
-    if (!fs.existsSync(outputDir))
-      fs.mkdirSync(outputDir, { recursive: true });
-
     const fileName = `CLASS_${classId}_ID_CARDS.pdf`;
-    const outputFile = path.join(outputDir, fileName);
+    const outputFile = tempPdfPath(fileName);
 
+    // Generated fresh and streamed straight back — no Storage upload
+    // needed, same reasoning as the single ID card route above.
+    const resolved = await withResolvedImagesForMany(data.meta || {}, classStudents);
     const { generateBulkIDCards } = require("./utils/idCardGenerator");
-    await generateBulkIDCards(classStudents, data.meta || {}, outputFile);
+    await generateBulkIDCards(resolved.people, resolved.meta, outputFile);
+    resolved.cleanup();
 
-    // ✅ Stream to browser
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename=${fileName}`
-    );
-
-    return res.sendFile(outputFile);
+    res.setHeader("Content-Disposition", `inline; filename=${fileName}`);
+    res.sendFile(outputFile, (err) => {
+      fs.unlink(outputFile, () => {});
+      if (err) console.error("Error streaming bulk ID cards:", err.message);
+    });
 
   } catch (err) {
     console.error("❌ Bulk ID card error:", err);
@@ -2387,20 +2382,20 @@ app.post("/api/admin/idcards/students/bulk", async (req, res) => {
       return res.status(404).json({ error: "No matching students found" });
     }
 
-    const outputDir = path.join(__dirname, "public/idcards");
-    if (!fs.existsSync(outputDir))
-      fs.mkdirSync(outputDir, { recursive: true });
-
     const fileName = `STUDENT_ID_CARDS_${Date.now()}.pdf`;
-    const outputFile = path.join(outputDir, fileName);
+    const outputFile = tempPdfPath(fileName);
 
+    const resolved = await withResolvedImagesForMany(data.meta || {}, selected);
     const { generateBulkIDCards } = require("./utils/idCardGenerator");
-    await generateBulkIDCards(selected, data.meta || {}, outputFile);
+    await generateBulkIDCards(resolved.people, resolved.meta, outputFile);
+    resolved.cleanup();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename=${fileName}`);
-
-    return res.sendFile(outputFile);
+    res.sendFile(outputFile, (err) => {
+      fs.unlink(outputFile, () => {});
+      if (err) console.error("Error streaming student ID cards:", err.message);
+    });
   } catch (err) {
     console.error("❌ Bulk student ID card error:", err);
     res.status(500).json({ error: "Failed to generate student ID cards" });
@@ -2431,20 +2426,20 @@ app.post("/api/admin/idcards/teachers/bulk", async (req, res) => {
       return res.status(404).json({ error: "No matching teachers found" });
     }
 
-    const outputDir = path.join(__dirname, "public/idcards");
-    if (!fs.existsSync(outputDir))
-      fs.mkdirSync(outputDir, { recursive: true });
-
     const fileName = `TEACHER_ID_CARDS_${Date.now()}.pdf`;
-    const outputFile = path.join(outputDir, fileName);
+    const outputFile = tempPdfPath(fileName);
 
+    const resolved = await withResolvedImagesForMany(data.meta || {}, teachers);
     const { generateBulkTeacherIDCards } = require("./utils/idCardGenerator");
-    await generateBulkTeacherIDCards(teachers, data.meta || {}, outputFile);
+    await generateBulkTeacherIDCards(resolved.people, resolved.meta, outputFile);
+    resolved.cleanup();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename=${fileName}`);
-
-    return res.sendFile(outputFile);
+    res.sendFile(outputFile, (err) => {
+      fs.unlink(outputFile, () => {});
+      if (err) console.error("Error streaming teacher ID cards:", err.message);
+    });
   } catch (err) {
     console.error("❌ Bulk teacher ID card error:", err);
     res.status(500).json({ error: "Failed to generate teacher ID cards" });
@@ -2509,7 +2504,7 @@ app.get("/api/broadcast", (req, res) => {
 });
 let receiptCounter = 1; // simple auto numbering
 
-app.post("/api/admin/receipts/bulk", (req, res) => {
+app.post("/api/admin/receipts/bulk", async (req, res) => {
   try {
     if (!req.session?.admin) {
       return res.status(401).json({ error: "Unauthorized" });
@@ -2537,7 +2532,14 @@ app.post("/api/admin/receipts/bulk", (req, res) => {
 
     doc.pipe(res);
 
-    const logoPath = meta.logo ? path.join(__dirname, "public", meta.logo.replace(/^\/?(public\/)?/, "")) : path.join(__dirname, "public", "logo.png");
+    // meta.logo is a Supabase Storage URL now — resolved to a local
+    // temp file first, since PDFKit's .image() needs a real local
+    // path or buffer, not a URL. This streams straight to the
+    // response and is never stored, so cleanup happens once the PDF
+    // finishes streaming (the "end" listener further below).
+    const logoResolved = await resolveImageForGeneration(meta.logo);
+    const logoPath = logoResolved.path || path.join(__dirname, "public", "logo.png");
+    doc.on("end", logoResolved.cleanup);
 
     const PAGE_WIDTH = doc.page.width;
     const RECEIPT_HEIGHT = 230; // height for each receipt
@@ -2754,7 +2756,7 @@ app.post("/api/admin/set-unlock-password", async (req, res) => {
 // ======================================================
 // DOWNLOAD STUDENT STATISTICS PDF (WITH SCHOOL HEADER)
 // ======================================================
-app.get("/api/admin/student-stats-pdf", (req, res) => {
+app.get("/api/admin/student-stats-pdf", async (req, res) => {
   try {
     const data = readData();
 
@@ -2779,6 +2781,13 @@ app.get("/api/admin/student-stats-pdf", (req, res) => {
 
     doc.pipe(res);
 
+    // data.meta.logo is a Supabase Storage URL now — resolved once,
+    // up front, to a local temp file, since drawHeader() below gets
+    // called multiple times (once per page) and PDFKit needs a real
+    // local path or buffer, not a URL.
+    const logoResolved = await resolveImageForGeneration(data.meta?.logo);
+    doc.on("end", logoResolved.cleanup);
+
     /* ========== HEADER FUNCTION ========== */
     function drawHeader() {
       // Border
@@ -2791,7 +2800,7 @@ app.get("/api/admin/student-stats-pdf", (req, res) => {
       ).stroke();
 
       // Logo
-      const logoPath = data.meta?.logo ? path.join(__dirname, "public", data.meta.logo.replace(/^\/?(public\/)?/, "")) : path.join(__dirname, "public", "logo.png");
+      const logoPath = logoResolved.path || path.join(__dirname, "public", "logo.png");
       if (fs.existsSync(logoPath)) {
         try {
           doc.image(logoPath, doc.page.width / 2 - 20, 40, { width: 40 });
@@ -3603,59 +3612,78 @@ app.get(
     }
 
     const timestamp = new Date().toISOString().replace(/[:T]/g, "-").split(".")[0];
-    const batchDir = path.join(__dirname, "reports", `class_${classId}_${timestamp}`);
-    fs.mkdirSync(batchDir, { recursive: true });
+    // Reports are generated straight to Supabase Storage now (see the
+    // loop below) — no local batch folder needed any more.
+
+    // baseMeta.logo is a Supabase Storage URL now — resolved once,
+    // up front (it's the same logo for every student in this batch),
+    // to a local temp file, since generateReportPDF needs a real
+    // local path or buffer, not a URL. Cleaned up once the whole
+    // batch is done, after the loop below.
+    const logoResolved = await withResolvedImages(baseMeta);
 
     const generated = [];
     const reportSheetEntries = []; // collected here, saved once in one batch update below
 
-    // =========================
-    // GENERATE PER-STUDENT REPORTS
-    // =========================
-    for (let i = 0; i < averages.length; i++) {
-      const { id } = averages[i];
-      const student = students.find(s => s.id === id);
-      if (!student) continue; // not one of the students we're actually generating for this run
-      const reportData = {};
+    try {
+      // =========================
+      // GENERATE PER-STUDENT REPORTS
+      // =========================
+      for (let i = 0; i < averages.length; i++) {
+        const { id } = averages[i];
+        const student = students.find(s => s.id === id);
+        if (!student) continue; // not one of the students we're actually generating for this run
+        const reportData = {};
 
-     (data.results || [])
-  .filter(r => r.studentId === id)
-  .forEach(r => {
+       (data.results || [])
+    .filter(r => r.studentId === id)
+    .forEach(r => {
 
-    let subjectId = null;
+      let subjectId = null;
 
-    // 🔹 Normalize subject field (ALL historical formats)
-    if (typeof r.subject === "string") {
-      subjectId = r.subject.trim().toUpperCase();
-    } else if (typeof r.subject === "object" && r.subject?.id) {
-      subjectId = String(r.subject.id).trim().toUpperCase();
-    }
+      // 🔹 Normalize subject field (ALL historical formats)
+      if (typeof r.subject === "string") {
+        subjectId = r.subject.trim().toUpperCase();
+      } else if (typeof r.subject === "object" && r.subject?.id) {
+        subjectId = String(r.subject.id).trim().toUpperCase();
+      }
 
-    // 🔹 Resolve name
-    const subjectName = subjectIdToName[subjectId];
-    if (!subjectName) return;
+      // 🔹 Resolve name
+      const subjectName = subjectIdToName[subjectId];
+      if (!subjectName) return;
 
-    reportData[subjectName] = {
-      test1: r.test1 || 0,
-      test2: r.test2 || 0,
-      test3: r.test3 || 0,
-      exam: r.exam || 0
-    };
-  });
+      reportData[subjectName] = {
+        test1: r.test1 || 0,
+        test2: r.test2 || 0,
+        test3: r.test3 || 0,
+        exam: r.exam || 0
+      };
+    });
 
 
-      const meta = { ...baseMeta, position: suffix(i + 1) };
-      const outPath = path.join(batchDir, `${id}_report.pdf`);
+        const meta = { ...logoResolved.meta, position: suffix(i + 1) };
+        // Generated to a temp file first (PDFKit needs a writable
+        // stream), then uploaded to Supabase Storage and the temp copy
+        // cleaned up — nothing is left behind on local disk for a
+        // redeploy or restart to lose.
+        const localPath = tempPdfPath(`${id}_report.pdf`);
 
-      await new Promise((resolve, reject) => {
-        generateReportPDF(meta, student, reportData, outPath, (err) => {
-          if (err) return reject(err);
-          const relPath = `/reports/${path.basename(batchDir)}/${path.basename(outPath)}`;
-          generated.push(relPath);
-          reportSheetEntries.push({ studentId: id, classId, filePath: relPath });
-          resolve();
+        await new Promise((resolve, reject) => {
+          generateReportPDF(meta, student, reportData, localPath, (err) => {
+            if (err) return reject(err);
+            resolve();
+          });
         });
-      });
+
+        const relPath = await uploadLocalFileAndCleanup(localPath, `reports/${classId}/${id}_report.pdf`);
+        generated.push(relPath);
+        reportSheetEntries.push({ studentId: id, classId, filePath: relPath });
+      }
+    } finally {
+      // Guaranteed to run even if generation fails partway through
+      // for one student — otherwise a single bad record could leave
+      // the resolved logo's temp file behind indefinitely.
+      logoResolved.cleanup();
     }
 
     if (reportSheetEntries.length) {
@@ -3687,8 +3715,7 @@ app.get(
     res.json({
       success: true,
       reports: generated,
-      count: generated.length,
-      folder: `/reports/${path.basename(batchDir)}`
+      count: generated.length
     });
 
   } catch (err) {
@@ -3779,24 +3806,33 @@ app.get(
       totalStudents: students.length
     };
 
-    const reportsDir = path.join(__dirname, "reports");
-    if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
-
-    const outPath = path.join(
-      reportsDir,
-      `Class_${classId}_FULL_REPORT.pdf`
-    );
+    // Generated to a temp file first (PDFKit needs a writable
+    // stream), then uploaded to Supabase Storage below. meta.logo is
+    // a Supabase Storage URL now — resolved to a local temp file
+    // first, generateClassReportPDF itself is completely unchanged.
+    const localPath = tempPdfPath(`Class_${classId}_FULL_REPORT.pdf`);
+    const logoResolved = await withResolvedImages(meta);
 
     generateClassReportPDF(
-      meta,
+      logoResolved.meta,
       students,
       data.results || [],
       subjects,
-      outPath,
-      (err) => {
+      localPath,
+      async (err) => {
+        logoResolved.cleanup();
+
         if (err) {
           console.error("PDF generation error:", err);
           return res.status(500).json({ error: "PDF generation failed." });
+        }
+
+        let relPath;
+        try {
+          relPath = await uploadLocalFileAndCleanup(localPath, `reports/${classId}/Class_${classId}_FULL_REPORT.pdf`);
+        } catch (uploadErr) {
+          console.error("Combined report storage upload failed:", uploadErr);
+          return res.status(500).json({ error: "Failed to store the generated report." });
         }
 
         // Was previously registering this SAME combined, whole-class
@@ -3816,7 +3852,7 @@ app.get(
 
         res.json({
           success: true,
-          file: `/reports/Class_${classId}_FULL_REPORT.pdf`
+          file: relPath
         });
       }
     );
@@ -3831,7 +3867,7 @@ app.get(
 // ---------------- SIGNATURE UPLOAD ROUTES ----------------
 
 // ✅ Upload teacher signature (Class-specific)
-app.post("/api/upload/teacher-signature/:classId", upload.single("signature"), (req, res) => {
+app.post("/api/upload/teacher-signature/:classId", upload.single("signature"), async (req, res) => {
   try {
     const { classId } = req.params;
     // This route had no auth check at all before — anyone who guessed
@@ -3845,61 +3881,26 @@ app.post("/api/upload/teacher-signature/:classId", upload.single("signature"), (
     if (!classId) return res.status(400).json({ error: "Missing classId parameter" });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Save inside main uploads folder so reportGenerator can find it
-    const uploadDir = path.join(__dirname, "public", "uploads");
-    fs.mkdirSync(uploadDir, { recursive: true });
+    // Uploaded to Supabase Storage — survives a redeploy or restart,
+    // which local disk never did.
+    const rel = await uploadBuffer(`signatures/${classId}_signature.png`, req.file.buffer, req.file.mimetype);
 
-    const filename = `${classId}_signature.png`;
-    const dest = path.join(uploadDir, filename);
+    const data = readData();
+    if (!data.classes) data.classes = [];
 
-    try {
-      if (fs.existsSync(dest)) fs.unlinkSync(dest);
-      fs.renameSync(req.file.path, dest);
-    } catch (mvErr) {
-      try {
-        fs.copyFileSync(req.file.path, dest);
-        fs.unlinkSync(req.file.path);
-      } catch (copyErr) {
-        console.error("Failed to store uploaded signature:", mvErr, copyErr);
-        return res.status(500).json({ error: "Failed to save uploaded file" });
-      }
+    let cls = data.classes.find(c => c.id === classId);
+    if (cls) {
+      cls.teacherSignature = rel;
+    } else {
+      data.classes.push({ id: classId, name: classId, teacherSignature: rel });
     }
 
-    const rel = `/uploads/${filename}`;
-
-    // Save signature path inside the class entry — properly persisted
-    // via the real database (readData/writeData), not a local file.
-    try {
-      const data = readData();
-      if (!data.classes) data.classes = [];
-
-      let cls = data.classes.find(c => c.id === classId);
-      if (cls) {
-        cls.teacherSignature = rel;
-      } else {
-        data.classes.push({ id: classId, name: classId, teacherSignature: rel });
-      }
-
-      writeData(data, ['classes']).then(() => {
-        res.json({
-          success: true,
-          file: rel,
-          message: `Signature uploaded and saved for class ${classId}.`
-        });
-      }).catch((err) => {
-        console.error("writeData error saving teacher signature:", err);
-        res.status(500).json({
-          success: false,
-          file: rel,
-          error: "File saved but metadata failed",
-          details: String(err)
-        });
-      });
-
-    } catch (metaErr) {
-      console.error("Error saving signature metadata:", metaErr);
-      return res.status(500).json({ error: "Failed to update metadata", details: String(metaErr) });
-    }
+    await writeData(data, ['classes']);
+    res.json({
+      success: true,
+      file: rel,
+      message: `Signature uploaded and saved for class ${classId}.`
+    });
 
   } catch (err) {
     console.error("Teacher signature upload error:", err);
@@ -3912,30 +3913,18 @@ app.post("/api/upload/principal-signature", upload.single("signature"), async (r
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const uploadDir = path.join(__dirname, "public/uploads");
-    fs.mkdirSync(uploadDir, { recursive: true });
+    // Uploaded to Supabase Storage — survives a redeploy or restart,
+    // which local disk never did.
+    const publicUrl = await uploadBuffer("branding/principal_signature.png", req.file.buffer, req.file.mimetype);
 
-    const dest = path.join(uploadDir, "principal_signature.png");
-
-    // Remove old file
-    if (fs.existsSync(dest)) fs.unlinkSync(dest);
-
-    // Save the new file
-    fs.renameSync(req.file.path, dest);
-
-    // Persisted via the real database now — this used to read and
-    // write the old data.json file directly, meaning an uploaded
-    // principal signature never actually reached the real dataset at
-    // all, and would silently vanish the moment anything reloaded
-    // from the database instead of that stale file.
     await updateData((data) => {
       data.meta = data.meta || {};
-      data.meta.signaturePrincipal = "/uploads/principal_signature.png";
+      data.meta.signaturePrincipal = publicUrl;
     }, ['settings']);
 
     res.json({
       success: true,
-      file: "/uploads/principal_signature.png",
+      file: publicUrl,
       message: "Principal signature uploaded successfully.",
     });
 
@@ -4092,18 +4081,22 @@ async function regenerateConsolidatedPDF(studentId, category) {
 
   const average = countedSubjects > 0 ? totalSum / countedSubjects : null;
 
-  const outDir = path.join(__dirname, 'files', student.classId, studentId);
-  fs.mkdirSync(outDir, { recursive: true });
   const filename = `${studentId}_${category.toUpperCase()}.pdf`;
-  const outPath = path.join(outDir, filename);
-  const relPath = `/files/${student.classId}/${studentId}/${filename}`;
+  // Generated to a temp file first (PDFKit needs a writable stream),
+  // then uploaded to Supabase Storage — this file gets regenerated
+  // and overwritten on every relevant score change, so it needs to
+  // genuinely persist, not just live on whatever server happened to
+  // generate it most recently.
+  const localPath = tempPdfPath(filename);
 
   await new Promise((resolve, reject) => {
-    generateConsolidatedResultPDF(data.meta, student, category, subjectRows, average, outPath, (err) => {
+    generateConsolidatedResultPDF(data.meta, student, category, subjectRows, average, localPath, (err) => {
       if (err) return reject(err);
       resolve();
     });
   });
+
+  const relPath = await uploadLocalFileAndCleanup(localPath, `summaries/${student.classId}/${filename}`);
 
   const pdfType = category === 'Tests' ? 'tests_summary' : 'exam_summary';
   await updateData((liveData) => {
@@ -4245,10 +4238,8 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
       console.error('regenerateConsolidatedPDF error:', pdfErr);
     }
 
-    const outDir = path.join(__dirname, 'files', classId, studentId);
-    fs.mkdirSync(outDir, { recursive: true });
     const filename = `exam_${type}_${studentId}_${Date.now()}.pdf`;
-    const outPath = path.join(outDir, filename);
+    const localPath = tempPdfPath(filename);
     const examMeta = {
       type,
       subject: subj.name,
@@ -4258,9 +4249,15 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
       percentage,
     };
 
+    // The logo and student's photo are now Supabase Storage URLs —
+    // fetched to quick local temp files here so generateExamPDF (kept
+    // completely unchanged) can keep working with real local paths
+    // exactly as it always has.
+    const resolved = await withResolvedImages(data.meta, student);
+
     // ✅ generate PDF including student photo + question images
-    generateExamPDF(data.meta, student, examMeta, outPath, (err) => {
-      const relPath = `/files/${classId}/${studentId}/${filename}`;
+    generateExamPDF(resolved.meta, resolved.student, examMeta, localPath, async (err) => {
+      resolved.cleanup();
 
       if (err) {
         // The score is already safely saved above — a PDF problem is
@@ -4273,6 +4270,21 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
           percentage,
           pdf: null,
           warning: 'Result saved, but the PDF could not be generated.',
+        });
+      }
+
+      let relPath;
+      try {
+        relPath = await uploadLocalFileAndCleanup(localPath, `exam-results/${classId}/${studentId}/${filename}`);
+      } catch (uploadErr) {
+        console.error('Exam PDF storage upload failed:', uploadErr);
+        return res.json({
+          success: true,
+          score,
+          total: totalPossible,
+          percentage,
+          pdf: null,
+          warning: 'Result saved, but the PDF could not be stored.',
         });
       }
 
@@ -4608,4 +4620,3 @@ for (const name of Object.keys(interfaces)) {
     }
   }
 }
-
