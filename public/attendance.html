@@ -230,16 +230,17 @@ hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
   <select id="classSelect"></select>
 
   <!-- Step 2 -->
+  <button onclick="loadStudents()">Load Students</button>
+
   <label style="margin-top:12px; display:block;">
-    Step 2: Enter Class Password
+    Step 2: Enter Class Password (needed when you submit, not before)
   </label>
   <input type="password" id="classPassword" placeholder="Class Password" />
 
-  <!-- Step 3 -->
-  <button onclick="loadStudents()">Verify Class</button>
-
   <p class="hint">
-    Students will only display after the correct class password.
+    Students load as soon as you select a class — the class password is only checked
+    when you actually submit attendance.
+
   </p>
 
   <hr />
