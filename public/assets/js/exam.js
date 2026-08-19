@@ -166,6 +166,12 @@ async function startTest(type) {
   if (activeTimer) clearInterval(activeTimer);
   timeLeft = j.duration ? j.duration * 60 : 1800;
 
+  // Distinguishes a genuine timeout from a manual submit click — a
+  // real timeout must still submit whatever's been answered so far,
+  // the "every question must be answered" rule below only applies to
+  // a student actively clicking Submit themselves.
+  let isTimeoutSubmit = false;
+
   const timerEl = document.createElement("div");
   timerEl.style.fontWeight = "bold";
   timerEl.style.marginBottom = "1rem";
@@ -179,6 +185,7 @@ async function startTest(type) {
     if (timeLeft <= 0) {
       clearInterval(activeTimer);
       activeTimer = null;
+      isTimeoutSubmit = true;
       form.requestSubmit();
     }
     timeLeft--;
@@ -216,6 +223,7 @@ qArea.appendChild(calcBtn);
   j.items.forEach((it, idx) => {
     const div = document.createElement("div");
     div.className = "question-block"; // ✅ Use your existing CSS class
+    div.id = "qblock-" + it.qid; // used to scroll to / highlight this question if left unanswered
     div.innerHTML = `<p class="question-text"><strong>Q${idx + 1}:</strong> ${it.text}</p>`;
 
     if (it.image) {
@@ -260,9 +268,42 @@ qArea.appendChild(calcBtn);
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
 
-    if (!confirm("Are you sure you want to submit your exam? You cannot change answers after submission.")) {
-      return;
+    if (!isTimeoutSubmit) {
+      // Every question must be answered before submission is allowed
+      // — this used to only show a progress counter and let an
+      // incomplete exam through regardless. Unanswered questions are
+      // cleared of any previous highlight first, so re-checking after
+      // answering some of them doesn't leave stale red borders behind.
+      document.querySelectorAll(".question-block.unanswered").forEach((el) => {
+        el.classList.remove("unanswered");
+      });
+
+      const unanswered = j.items.filter((it) => !studentAnswers[it.qid]);
+      if (unanswered.length > 0) {
+        unanswered.forEach((it) => {
+          const block = document.getElementById("qblock-" + it.qid);
+          if (block) {
+            block.classList.add("unanswered");
+            block.style.border = "2px solid #c0392b";
+            block.style.borderRadius = "8px";
+            block.style.padding = "10px";
+          }
+        });
+        alert(
+          `You have ${unanswered.length} unanswered question(s). Every question must be answered before you can submit — they're highlighted in red below.`
+        );
+        const firstBlock = document.getElementById("qblock-" + unanswered[0].qid);
+        if (firstBlock) firstBlock.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+
+      if (!confirm("Are you sure you want to submit your exam? You cannot change answers after submission.")) {
+        return;
+      }
     }
+    // A genuine timeout skips both the completeness check and the
+    // confirmation dialog above — time's up means time's up, whatever
+    // has been answered so far is submitted automatically.
 
     if (activeTimer) clearInterval(activeTimer);
 
@@ -335,4 +376,3 @@ window.addEventListener("beforeunload", function (e) {
 window.loginStudent = loginStudent;
 window.startTest = startTest;
 window.showInstructions = showInstructions;
-
