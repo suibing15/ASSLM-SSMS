@@ -1,7 +1,6 @@
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-const { fitSingleLine } = require("./pdfTextFit");
 
 /* ================= CONSTANTS ================= */
 const BORDER_MARGIN = 25;
@@ -29,7 +28,15 @@ function drawHeader(doc, meta, title, subtitleLines = []) {
   ).stroke();
 
   // Logo
-  const logoPath = meta.logo ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, "")) : path.join(__dirname, "../public/logo.png");
+  // meta.logo may now be a genuine, already-existing absolute temp
+  // path (resolved ahead of time in server.js before calling this
+  // function), not just the old "/uploads/xyz.png"-style web path
+  // this line was originally written for.
+  const logoPath = meta.logo && fs.existsSync(meta.logo)
+    ? meta.logo
+    : meta.logo
+      ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, ""))
+      : path.join(__dirname, "../public/logo.png");
   if (fs.existsSync(logoPath)) {
     doc.image(logoPath, doc.page.width / 2 - 20, 40, { width: 40 });
   }
@@ -172,7 +179,7 @@ function generateClassAttendancePDF({
     }
 
     doc.font("Helvetica").fontSize(8).fillColor("#000");
-    fitSingleLine(doc, `${st.name} (${st.id})`, startX, y, nameColWidth - 4, { startSize: 8, minSize: 6, font: "Helvetica" });
+    doc.text(`${st.name} (${st.id})`, startX, y, { width: nameColWidth });
 
     days.forEach((d, i) => {
       const x = startX + nameColWidth + i * colWidth;
@@ -189,16 +196,10 @@ function generateClassAttendancePDF({
 }
 
 /* ================= TEACHER ATTENDANCE ================= */
-// Rebuilt to match the class attendance report exactly: one row per
-// teacher, one column per day, instead of a single summary count.
-// Reads from teacherAttendance (each teacher's own login-based daily
-// record), not the class attendance object — that's a different
-// thing entirely (who signed a CLASS in, not whether a teacher
-// themselves was present that day).
 function generateTeacherAttendancePDF({
   meta,
   teachers,
-  teacherAttendance,
+  attendance,
   fromDate,
   toDate,
   outPath
@@ -208,67 +209,50 @@ function generateTeacherAttendancePDF({
 
   const periodLabel = getPeriodLabel(fromDate, toDate);
 
-  drawHeader(doc, meta, "TEACHER ATTENDANCE REPORT", [`Period: ${periodLabel}`]);
-  doc.on("pageAdded", () =>
-    drawHeader(doc, meta, "TEACHER ATTENDANCE REPORT", [`Period: ${periodLabel}`])
+  drawHeader(
+    doc,
+    meta,
+    "TEACHER ATTENDANCE SUMMARY",
+    [`Period: ${periodLabel}`]
   );
 
-  const allDays = new Set();
-  Object.values(teacherAttendance || {}).forEach(days => {
-    Object.keys(days || {}).forEach(d => allDays.add(d));
-  });
-  const days = [...allDays]
-    .filter(d => (!fromDate || d >= fromDate) && (!toDate || d <= toDate))
-    .sort();
-
-  if (!days.length) {
-    doc.text("No attendance records for selected period.");
-    doc.end();
-    return new Promise(res => doc.on("end", res));
-  }
-
-  const nameColWidth = 150;
-  const colWidth = Math.max(55, Math.min(80, (CONTENT_WIDTH - nameColWidth) / days.length));
-  const rowHeight = 13;
-  const startX = INNER_MARGIN;
-
-  function drawMatrixHeader(y) {
-    doc.font("Helvetica-Bold").fontSize(8);
-    doc.text("Teacher", startX, y, { width: nameColWidth });
-    days.forEach((d, i) => {
-      const x = startX + nameColWidth + i * colWidth;
-      doc.text(d, x, y, { width: colWidth, align: "center" });
-    });
-    return y + 16;
-  }
-
-  let y = drawMatrixHeader(doc.y);
+  doc.on("pageAdded", () =>
+    drawHeader(
+      doc,
+      meta,
+      "TEACHER ATTENDANCE SUMMARY",
+      [`Period: ${periodLabel}`]
+    )
+  );
 
   teachers.forEach(t => {
-    if (y > doc.page.height - 60) {
-      doc.addPage();
-      y = drawMatrixHeader(doc.y);
-    }
+    let count = 0;
 
-    doc.font("Helvetica").fontSize(8).fillColor("#000");
-    fitSingleLine(doc, `${t.name} (${t.id})`, startX, y, nameColWidth - 4, { startSize: 8, minSize: 6, font: "Helvetica" });
-
-    days.forEach((d, i) => {
-      const x = startX + nameColWidth + i * colWidth;
-      const present = !!(teacherAttendance?.[t.id]?.[d]);
-      doc.fillColor(present ? "#006400" : "#b00000");
-      doc.text(present ? "P" : "A", x, y, { width: colWidth, align: "center" });
+    Object.values(attendance || {}).forEach(clsDays => {
+      Object.entries(clsDays).forEach(([date, day]) => {
+        if (
+          day.teacherId === t.id &&
+          (!fromDate || date >= fromDate) &&
+          (!toDate || date <= toDate)
+        ) {
+          count++;
+        }
+      });
     });
-    doc.fillColor("#000");
-    y += rowHeight;
+
+    doc.font("Helvetica").fontSize(10);
+    doc.text(
+      `${t.name} (${t.id}) — Signed ${count} day(s)`,
+      INNER_MARGIN,
+      doc.y,
+      { width: CONTENT_WIDTH }
+    );
   });
 
   doc.end();
-  return new Promise(res => doc.on("end", res));
 }
 
 module.exports = {
   generateClassAttendancePDF,
   generateTeacherAttendancePDF
 };
-
