@@ -1,7 +1,6 @@
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-const { fitSingleLine } = require("./pdfTextFit");
 
 /* =========================================================
    CONSTANTS – CR80 PLASTIC ID SIZE
@@ -94,7 +93,7 @@ function drawFront(doc, student, meta, x, y, scale = 1, plainPassword) {
     );
 
   /* ---------- LOGO ---------- */
-  const logo = meta.logo ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, "")) : path.join(__dirname, "../public/images/logo.png");
+  const logo = resolveImage(meta.logo) || path.join(__dirname, "../public/images/logo.png");
   if (fs.existsSync(logo)) {
     doc.image(logo, sx(W - 42), sy(48), { width: 28 });
   }
@@ -127,9 +126,7 @@ if (photoPath) {
   let ty = sy(58);
   const gap = 12 * scale;
 
-  fitSingleLine(doc, `Name: ${student.name || "N/A"}`, sx(82), ty, W - 82 * scale - 8, { startSize: 7.2 * scale, minSize: 5 * scale, font: "Helvetica" });
-  ty += gap;
-  doc.font("Helvetica").fontSize(7.2 * scale);
+  doc.text(`Name: ${student.name || "N/A"}`, sx(82), ty); ty += gap;
   doc.text(`Class: ${student.classId || "N/A"}`, sx(82), ty); ty += gap;
   doc.text(`ID: ${student.studentId || student.id || "N/A"}`, sx(82), ty); ty += gap;
   doc.text(`Password: ${plainPassword || "Contact admin for login details"}`, sx(82), ty);
@@ -243,8 +240,7 @@ async function generateBulkIDCards(students, meta, outputPath) {
 module.exports = {
   generateIDCard,
   generateBulkIDCards,
-  generateTeacherIDCard,
-  generateBulkTeacherIDCards
+  generateTeacherIDCard
 };
 
 /* =========================================================
@@ -335,9 +331,7 @@ function drawTeacherFront(doc, teacher, meta, x, y, scale = 1) {
   let ty = sy(58);
   const gap = 12 * scale;
 
-  fitSingleLine(doc, `Name: ${teacher.name || "N/A"}`, sx(82), ty, W - 82 * scale - 8, { startSize: 7.2 * scale, minSize: 5 * scale, font: "Helvetica" });
-  ty += gap;
-  doc.font("Helvetica").fontSize(7.2 * scale);
+  doc.text(`Name: ${teacher.name || "N/A"}`, sx(82), ty); ty += gap;
   doc.text(`ID: ${teacher.id || "N/A"}`, sx(82), ty);
 
   /* ---------- FOOTER ---------- */
@@ -365,43 +359,3 @@ async function generateTeacherIDCard(teacher, meta, outputPath) {
   doc.end();
   return new Promise(res => stream.on("finish", res));
 }
-
-/* =========================================================
-   BULK TEACHER ID CARDS — one combined PDF, several cards per
-   page, mirroring generateBulkIDCards' exact grid (2 columns,
-   4 rows, same scale and spacing) so both sheets print the
-   same way and cut to the same size.
-   ========================================================= */
-async function generateBulkTeacherIDCards(teachers, meta, outputPath) {
-  const doc = new PDFDocument({ size: "A4", margin: 20 });
-  const stream = fs.createWriteStream(outputPath);
-  doc.pipe(stream);
-
-  const scale = 0.9;
-  const cols = 2;
-  const rows = 4;
-  const gapX = 18;
-  const gapY = 18;
-
-  let i = 0;
-
-  teachers.forEach(teacher => {
-    if (i === cols * rows) {
-      doc.addPage();
-      i = 0;
-    }
-
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-
-    const x = 20 + col * (CARD_W * scale + gapX);
-    const y = 20 + row * (CARD_H * scale + gapY);
-
-    drawTeacherFront(doc, teacher, meta, x, y, scale);
-    i++;
-  });
-
-  doc.end();
-  return new Promise(res => stream.on("finish", res));
-}
-
