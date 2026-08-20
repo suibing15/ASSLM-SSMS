@@ -4109,12 +4109,22 @@ async function regenerateConsolidatedPDF(studentId, category) {
   // generate it most recently.
   const localPath = tempPdfPath(filename);
 
-  await new Promise((resolve, reject) => {
-    generateConsolidatedResultPDF(data.meta, student, category, subjectRows, average, localPath, (err) => {
-      if (err) return reject(err);
-      resolve();
+  // data.meta.logo is a Supabase Storage URL now — resolved to a
+  // local temp file first. This call was missing entirely before —
+  // the upload/storage side got fixed, but the logo itself never
+  // did, for this specific PDF.
+  const logoResolved = await withResolvedImages(data.meta);
+
+  try {
+    await new Promise((resolve, reject) => {
+      generateConsolidatedResultPDF(logoResolved.meta, student, category, subjectRows, average, localPath, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
     });
-  });
+  } finally {
+    logoResolved.cleanup();
+  }
 
   const relPath = await uploadLocalFileAndCleanup(localPath, `summaries/${student.classId}/${filename}`);
 
