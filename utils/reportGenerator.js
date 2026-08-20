@@ -3,7 +3,6 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
 const dayjs = require("dayjs");
-const { fitSingleLine, measureWrappedHeight } = require("./pdfTextFit");
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -30,6 +29,85 @@ function getRecommendation(avg) {
   return "Needs serious improvement and closer attention.";
 }
 
+// ======================================================================
+//   OPTIMIZED TRIPLE-LAYER EMBOSSED WATERMARK (FAST VERSION)
+// ======================================================================
+function applyAshBackgroundWithWatermark(doc, text) {
+  const W = doc.page.width;
+  const H = doc.page.height;
+
+  // White background
+  doc.save();
+  doc.rect(0, 0, W, H).fillColor("#ffffff").fill();
+  doc.restore();
+
+  // Common settings
+  const baseFont = "Helvetica-Bold";
+  const size = 4.5;      // reduced from 5 → faster
+  const opacity1 = 0.08;
+  const opacity2 = 0.12;
+  const opacity3 = 0.18;
+
+  // Slight variations
+  const rot1 = -36;
+  const rot2 = -36.4;
+  const rot3 = -36.8;
+
+  // **Optimized loop grid size**
+  const dx = 32;   // spacing horizontally
+  const dy = 12;   // spacing vertically
+
+  // =============== LAYER 1 ===============
+  doc.save();
+  doc.font(baseFont).fontSize(size);
+  doc.fillColor("#d6d6d6");
+  doc.opacity(opacity1);
+  doc.rotate(rot1, { origin: [W / 2, H / 2] });
+
+  for (let y = -H; y < H * 2; y += dy) {
+    for (let x = -W; x < W * 2; x += dx) {
+      doc.text(text, x, y, { lineBreak: false });
+    }
+  }
+  doc.restore();
+
+  // =============== LAYER 2 ===============
+  doc.save();
+  doc.font(baseFont).fontSize(size);
+  doc.fillColor("#b8b8b8");
+  doc.opacity(opacity2);
+  doc.rotate(rot2, { origin: [W / 2, H / 2] });
+
+  for (let y = -H; y < H * 2; y += dy) {
+    for (let x = -W; x < W * 2; x += dx) {
+      doc.text(text, x + 5, y + 4, { lineBreak: false });
+    }
+  }
+  doc.restore();
+
+  // =============== LAYER 3 ===============
+  doc.save();
+  doc.font(baseFont).fontSize(size);
+  doc.fillColor("#f7f7f7");
+  doc.opacity(opacity3);
+  doc.rotate(rot3, { origin: [W / 2, H / 2] });
+
+  for (let y = -H; y < H * 2; y += dy) {
+    for (let x = -W; x < W * 2; x += dx) {
+      doc.text(text, x + 9, y + 7, { lineBreak: false });
+    }
+  }
+  doc.restore();
+
+  // Reset
+  doc.opacity(1).fillColor("#000");
+}
+
+
+
+/**
+ * Generates PDF report
+ */
 function generateReportPDF(meta, student, reportData, outPath, callback) {
   try {
     ensureDir(path.dirname(outPath));
@@ -39,13 +117,15 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
     doc.pipe(stream);
 
     // ======================================================
-    // Plain white background — the watermark that used to be here
-    // has been removed, matching the combined class report generator,
-    // which never had one.
+    // 1. APPLY WATERMARK + BACKGROUND FIRST
     // ======================================================
+    applyAshBackgroundWithWatermark(
+      doc,
+      meta.schoolName || "ASSALAM INTERNATIONAL ACADEMIC SCHOOL GARKO"
+    );
 
     // ======================================================
-    // BORDER
+    // 2. BORDER (always above watermark)
     // ======================================================
     const margin = 25;
     doc.lineWidth(1).strokeColor("#888");
@@ -57,7 +137,15 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
     ).stroke();
 
     // ===== LOGO =====
-    const logoPath = meta.logo ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, "")) : path.join(__dirname, "../public/logo.png");
+    // meta.logo may now be a genuine, already-existing absolute temp
+    // path (resolved ahead of time in server.js before calling this
+    // function), not just the old "/uploads/xyz.png"-style web path
+    // this line was originally written for.
+    const logoPath = meta.logo && fs.existsSync(meta.logo)
+      ? meta.logo
+      : meta.logo
+        ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, ""))
+        : path.join(__dirname, "../public/logo.png");
     if (fs.existsSync(logoPath)) {
       try {
         doc.image(logoPath, doc.page.width / 2 - 20, 40, { width: 40 });
@@ -67,22 +155,18 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
     // ===== TITLE BOX =====
     const schoolName = meta.schoolName || "SCHOOL NAME";
     doc.font("Helvetica-Bold").fontSize(15);
-    const pageContentWidth = doc.page.width - 120; // keep the school name box safely inside the margins
-    const boxWidth = Math.min(doc.widthOfString(schoolName) + 60, pageContentWidth);
+    const boxWidth = doc.widthOfString(schoolName) + 60;
     const boxX = (doc.page.width - boxWidth) / 2;
     const boxY = 90;
 
     doc.rect(boxX, boxY, boxWidth, 28).stroke();
-    fitSingleLine(doc, schoolName, 0, boxY + 7, doc.page.width, { startSize: 15, minSize: 9, font: "Helvetica-Bold", align: "center" });
+    doc.text(schoolName, 0, boxY + 7, { align: "center" });
 
-    // Address + details — each kept to one line on purpose, since the
-    // lines below are positioned at fixed offsets; letting one of
-    // these wrap to two lines would silently run into the line below it.
+    // Address + details
     doc.font("Helvetica").fontSize(10).fillColor("#333");
-    fitSingleLine(doc, `Address: ${meta.address || "Behind Garko Motor Park, Opp. Tasidi Filling Station"}`, 0, boxY + 38, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
-    fitSingleLine(doc, `Motto: ${meta.motto || "Success comes after tears"}`, 0, boxY + 52, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
-    fitSingleLine(doc, `Phone: ${meta.phone || "08165789331, 08103992584, 08151015152"}`, 0, boxY + 66, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
-    doc.fillColor("#000");
+    doc.text(`Address: ${meta.address || "Behind Garko Motor Park, Opp. Tasidi Filling Station"}`, 0, boxY + 38, { align: "center" });
+    doc.text(`Motto: ${meta.motto || "Success comes after tears"}`, 0, boxY + 52, { align: "center" });
+    doc.text(`Phone: ${meta.phone || "08165789331, 08103992584, 08151015152"}`, 0, boxY + 66, { align: "center" });
 
     doc.moveTo(60, boxY + 82).lineTo(540, boxY + 82).stroke();
 
@@ -116,8 +200,8 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
 
     const sessionValue = meta.session || meta.Session || meta.sessionName || "";
 
-    fitSingleLine(doc, `Name: ${student.name}`, 60, infoY, 230, { startSize: 10, minSize: 7, font: "Helvetica" });
-    fitSingleLine(doc, `Class: ${classDisplay}`, 60, infoY + 14, 230, { startSize: 10, minSize: 7, font: "Helvetica" });
+    doc.text(`Name: ${student.name}`, 60, infoY);
+    doc.text(`Class: ${classDisplay}`, 60, infoY + 14);
     doc.text(`Admission No: ${student.id}`, 60, infoY + 28);
 
     doc.text(`Term: ${meta.term}`, 300, infoY);
@@ -160,17 +244,7 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
       subjectCount++;
 
       const vals = [subject, t1, t2, t3, ex, total, grade, remark];
-      const colWidths = [110, 45, 45, 45, 55, 55, 45, 45]; // matches the gaps between colX entries
-      vals.forEach((v, i) => {
-        if (i === 0 || i === 7) {
-          // Subject name and Remark are the two fields with real
-          // variable length — everything else is a short number or
-          // a single letter grade that's never at risk of overflow.
-          fitSingleLine(doc, String(v), colX[i], y, colWidths[i], { startSize: 9, minSize: 6.5, font: "Helvetica" });
-        } else {
-          doc.text(String(v), colX[i], y);
-        }
-      });
+      vals.forEach((v,i)=> doc.text(String(v), colX[i], y));
 
       y += 14;
 
@@ -178,7 +252,10 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
         // NEW PAGE
         doc.addPage();
 
-        // border only — no watermark
+        // Repeat background + watermark
+        applyAshBackgroundWithWatermark(doc, meta.schoolName || "ASSALAM INTERNATIONAL ACADEMIC SCHOOL GARKO");
+
+        // border
         doc.lineWidth(1).strokeColor("#888");
         doc.rect(margin, margin, doc.page.width - margin * 2, doc.page.height - margin * 2).stroke();
 
@@ -202,19 +279,6 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
 
     const recommendation = getRecommendation(avg);
 
-    // Estimate the whole remaining footer (recommendation + gap +
-    // signature line) before drawing any of it — if it wouldn't fit
-    // on this page, start a fresh one now instead of letting it run
-    // past the bottom border.
-    const estimatedRecHeight = measureWrappedHeight(doc, recommendation, 380, 10, "Helvetica");
-    const estimatedFooterHeight = 28 + 14 + estimatedRecHeight + Math.max(90, estimatedRecHeight + 76) + 55;
-    if (y + estimatedFooterHeight > doc.page.height - 60) {
-      doc.addPage();
-      doc.lineWidth(1).strokeColor("#888");
-      doc.rect(margin, margin, doc.page.width - margin * 2, doc.page.height - margin * 2).stroke();
-      y = 60;
-    }
-
     y += 28;
     doc.text("Teacher's Recommendation:",60,y);
 
@@ -225,11 +289,7 @@ function generateReportPDF(meta, student, reportData, outPath, callback) {
     doc.font("Helvetica").fontSize(10).text(meta.nextTermBegins || "TBA",400,y+14);
 
     // ===== SIGNATURES =====
-    // The gap before signatures scales with how tall the recommendation
-    // actually rendered — a longer comment that wraps to 2-3 lines no
-    // longer runs into the signature block below it.
-    const recommendationHeight = measureWrappedHeight(doc, recommendation, 380, 10, "Helvetica");
-    y += Math.max(90, recommendationHeight + 76);
+    y += 90;
     doc.font("Helvetica-Bold").fontSize(10);
     doc.text("Teacher's Signature:",60,y);
     doc.text("Principal's Signature:",350,y);
@@ -294,5 +354,3 @@ if (fs.existsSync(principalSig)) {
 }
 
 module.exports = { generateReportPDF };
-
-
