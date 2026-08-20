@@ -17,6 +17,16 @@ function ensureDir(p) {
 
 function resolveLocalPath(p) {
   if (!p) return null;
+
+  // If this is already a real, existing local path — exactly what
+  // storage.js's resolveImageForGeneration hands in now (a genuine
+  // absolute OS temp file path, e.g. "/tmp/173829_abc.png") — use it
+  // directly. The candidate-guessing below was built assuming its
+  // input is always a "/uploads/xyz.png"-style web path relative to
+  // this app's own folders, and mangles a real absolute path into
+  // something that never exists, silently dropping the logo.
+  if (fs.existsSync(p)) return p;
+
   const clean = String(p).replace(/^\/+/, '');
 
   // Question images and branding images (logo/signature) both get
@@ -45,7 +55,13 @@ function generateExamPDF(meta, student, examMeta, outPath, callback) {
     const stream = fs.createWriteStream(outPath);
     doc.pipe(stream);
 
-    const logoPath = meta.logo ? path.join(__dirname, '..', 'public', meta.logo.replace(/^\//, '')) : path.join(__dirname, '../public/logo.png');
+    // Uses the same safe resolveLocalPath() helper as the other logo
+    // block further down in this file — this one had its own
+    // separate, still-broken inline copy that never got the fix,
+    // which is exactly why one PDF type from this file kept losing
+    // its logo while the other (already using resolveLocalPath)
+    // worked fine.
+    const logoPath = resolveLocalPath(meta.logo) || path.join(__dirname, '../public/logo.png');
     const margin = 25;
 
     doc.on('pageAdded', () => {
