@@ -1,7 +1,6 @@
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-const { fitSingleLine, measureWrappedHeight } = require("./pdfTextFit");
 
 /* ================= CONSTANTS ================= */
 const BORDER_MARGIN = 25;
@@ -27,7 +26,18 @@ async function generateQuestionPDF(meta, questions, outputPath) {
     ).stroke();
 
     // Logo
-    const logoPath = meta.logo ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, "")) : path.join(__dirname, "../public/logo.png");
+    // meta.logo may now be a genuine, already-existing absolute temp
+    // path (from storage.js's resolveImageForGeneration), not just
+    // the old "/uploads/xyz.png"-style web path this line was
+    // originally written for — check for that first, since blindly
+    // stripping a leading slash and rebuilding it as a "public/..."
+    // path silently produces a path that never exists otherwise,
+    // dropping the logo with no visible error.
+    const logoPath = meta.logo && fs.existsSync(meta.logo)
+      ? meta.logo
+      : meta.logo
+        ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, ""))
+        : path.join(__dirname, "../public/logo.png");
     if (fs.existsSync(logoPath)) {
       try {
         doc.image(logoPath, doc.page.width / 2 - 20, 40, { width: 40 });
@@ -37,33 +47,32 @@ async function generateQuestionPDF(meta, questions, outputPath) {
     // School name box
     doc.font("Helvetica-Bold").fontSize(14);
     const name = meta.schoolName || "ASSALAM INTERNATIONAL ACADEMIC SCHOOL";
-    const boxW = Math.min(doc.widthOfString(name) + 60, doc.page.width - 120);
+    const boxW = doc.widthOfString(name) + 60;
     const boxX = (doc.page.width - boxW) / 2;
     const boxY = 90;
 
     doc.rect(boxX, boxY, boxW, 26).stroke();
-    fitSingleLine(doc, name, 0, boxY + 6, doc.page.width, { startSize: 14, minSize: 8, font: "Helvetica-Bold", align: "center" });
+    doc.text(name, 0, boxY + 6, { align: "center" });
 
-    // School info — each kept to one line since the lines below sit
-    // at fixed offsets from each other.
+    // School info
     doc.font("Helvetica").fontSize(9);
-    fitSingleLine(
-      doc,
+    doc.text(
       `Address: ${meta.address || "Behind Garko Motor Park, Opp. Tasidi Filling Station"}`,
-      INNER_MARGIN, boxY + 36, CONTENT_WIDTH,
-      { startSize: 9, minSize: 6.5, font: "Helvetica", align: "center" }
+      INNER_MARGIN,
+      boxY + 36,
+      { width: CONTENT_WIDTH, align: "center" }
     );
-    fitSingleLine(
-      doc,
+    doc.text(
       `Motto: ${meta.motto || "Success comes after tears"}`,
-      INNER_MARGIN, boxY + 50, CONTENT_WIDTH,
-      { startSize: 9, minSize: 6.5, font: "Helvetica", align: "center" }
+      INNER_MARGIN,
+      boxY + 50,
+      { width: CONTENT_WIDTH, align: "center" }
     );
-    fitSingleLine(
-      doc,
+    doc.text(
       `Phone: ${meta.phone || "08165789331, 08103992584, 08151015152, 07068595598"}`,
-      INNER_MARGIN, boxY + 64, CONTENT_WIDTH,
-      { startSize: 9, minSize: 6.5, font: "Helvetica", align: "center" }
+      INNER_MARGIN,
+      boxY + 64,
+      { width: CONTENT_WIDTH, align: "center" }
     );
 
     doc.moveTo(60, boxY + 80).lineTo(540, boxY + 80).stroke();
@@ -96,16 +105,6 @@ async function generateQuestionPDF(meta, questions, outputPath) {
   let colY = [doc.y, doc.y];
   const bottomLimit = doc.page.height - 70;
 
-  function measureQuestionBlock(q, idx, width) {
-    const questionLine = `${idx + 1}. ${q.text}`;
-    let height = measureWrappedHeight(doc, questionLine, width, 9, "Helvetica-Bold");
-    if (Array.isArray(q.options) && q.options.length) {
-      const optionsLine = q.options.map((opt, i) => `${String.fromCharCode(65 + i)}. ${opt}`).join("   ");
-      height += 2 + measureWrappedHeight(doc, optionsLine, width, 8, "Helvetica");
-    }
-    return height + 6; // matches the small gap drawQuestionBlock adds after itself
-  }
-
   function drawQuestionBlock(q, idx, x, y, width) {
     doc.font("Helvetica-Bold").fontSize(9).fillColor("#000");
     doc.text(`${idx + 1}. ${q.text}`, x, y, { width });
@@ -126,13 +125,7 @@ async function generateQuestionPDF(meta, questions, outputPath) {
     const x = col === 0 ? col1X : col2X;
     let y = colY[col];
 
-    // Measure the whole block BEFORE deciding whether it fits — the
-    // old check only looked at where the block starts, not how tall
-    // a long question (or many options) would actually make it,
-    // which is exactly what let content run past the bottom border.
-    const estimatedHeight = measureQuestionBlock(q, idx, colWidth);
-
-    if (y + estimatedHeight > bottomLimit) {
+    if (y > bottomLimit) {
       doc.addPage();
       colY = [doc.y, doc.y];
       y = colY[col];
