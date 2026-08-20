@@ -4477,8 +4477,19 @@ app.post('/api/portal/parent/download', async (req, res) => {
       });
     }
 
-    // CLEAN STALE ENTRIES: remove any PDF references that no longer exist
+    // CLEAN STALE ENTRIES: this used to check fs.existsSync() on every
+    // filePath to drop anything that no longer exists — but every
+    // filePath is now a full Supabase Storage URL, not a local path.
+    // Stripping the leading slash off "https://..." does nothing
+    // useful, and joining the result with __dirname produces a path
+    // that can never exist on local disk — meaning this was silently
+    // removing every single real PDF before the response was even
+    // built. A URL is trusted as-is (it was only ever stored here
+    // after a successful upload); the local-existence check now only
+    // still applies to genuine old-style relative paths, for any
+    // pre-migration data that hasn't been regenerated yet.
     pdfs = pdfs.filter(p => {
+      if (/^https?:\/\//i.test(p.filePath)) return true;
       const fullPath = path.join(__dirname, p.filePath.replace(/^\/+/, ''));
       return fs.existsSync(fullPath);
     });
@@ -4487,9 +4498,17 @@ app.post('/api/portal/parent/download', async (req, res) => {
     // write the cleaned-up list straight to the old data.json file,
     // a file nothing else in the system reads, so the cleanup never
     // really took effect on the real dataset at all.
+    //
+    // This had the exact same bug as the filter above, and it was
+    // far more serious here: since this actually writes to the real
+    // database, it was permanently deleting every valid Supabase-URL
+    // PDF entry for this student, on every single call to this
+    // route — a parent opening their portal was quietly erasing
+    // their own child's real records each time.
     await updateData((liveData) => {
       liveData.pdfs = (liveData.pdfs || []).filter(p => {
         if (p.studentId !== studentId) return true; // leave other students' entries untouched
+        if (/^https?:\/\//i.test(p.filePath)) return true;
         const fullPath = path.join(__dirname, p.filePath.replace(/^\/+/, ''));
         return fs.existsSync(fullPath);
       });
