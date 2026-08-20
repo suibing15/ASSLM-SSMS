@@ -383,6 +383,14 @@ app.use(cors({
   credentials: true
 }));
 
+// Render (and most hosting platforms) sit behind a reverse proxy that
+// terminates HTTPS and forwards plain HTTP internally — without this,
+// Express has no way to know the original connection was actually
+// secure, and would refuse to set the "secure: true" session cookie
+// configured below, silently breaking cross-origin login in
+// production even though the site is genuinely running on HTTPS.
+app.set("trust proxy", 1);
+
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
@@ -398,8 +406,20 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: false,
-    sameSite: "lax"
+    // "lax" cookies are never sent on a cross-origin fetch/XHR call —
+    // only on a direct top-level link click. Since the real frontend
+    // and this backend live on two different domains once actually
+    // deployed (Render + wherever the Next.js frontend is hosted),
+    // every login-dependent request would silently arrive with no
+    // session cookie at all, looking exactly like "the frontend can't
+    // reach the backend" even though the connection itself is fine.
+    // "none" fixes this, but browsers require "secure: true" the
+    // moment sameSite is "none" — which needs real HTTPS, so this
+    // only switches on in production (Render). Local development
+    // (plain http://localhost) keeps the old, working lax/insecure
+    // settings, since secure cookies are never sent over plain HTTP.
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax"
   }
 }));
 
