@@ -3,7 +3,6 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
 const dayjs = require("dayjs");
-const { fitSingleLine, measureWrappedHeight } = require("./pdfTextFit");
 
 /* ================= CONSTANTS ================= */
 const BORDER_MARGIN = 25;
@@ -51,24 +50,32 @@ function generateClassReportPDF(meta, students, results, subjects, outPath, call
         doc.page.height - BORDER_MARGIN * 2
       ).stroke();
 
-      const logoPath = meta.logo ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, "")) : path.join(__dirname, "../public/logo.png");
+      // meta.logo may now be a genuine, already-existing absolute
+      // temp path (resolved ahead of time in server.js before
+      // calling this function), not just the old "/uploads/xyz.png"-
+      // style web path this line was originally written for.
+      const logoPath = meta.logo && fs.existsSync(meta.logo)
+        ? meta.logo
+        : meta.logo
+          ? path.join(__dirname, "..", "public", meta.logo.replace(/^\//, ""))
+          : path.join(__dirname, "../public/logo.png");
       if (fs.existsSync(logoPath)) {
         try { doc.image(logoPath, doc.page.width / 2 - 20, 40, { width: 40 }); } catch {}
       }
 
       doc.font("Helvetica-Bold").fontSize(15);
       const name = meta.schoolName || "SCHOOL NAME";
-      const boxW = Math.min(doc.widthOfString(name) + 60, doc.page.width - 120);
+      const boxW = doc.widthOfString(name) + 60;
       const boxX = (doc.page.width - boxW) / 2;
       const boxY = 90;
 
       doc.rect(boxX, boxY, boxW, 28).stroke();
-      fitSingleLine(doc, name, 0, boxY + 7, doc.page.width, { startSize: 15, minSize: 9, font: "Helvetica-Bold", align: "center" });
+      doc.text(name, 0, boxY + 7, { align: "center" });
 
       doc.font("Helvetica").fontSize(10);
-      fitSingleLine(doc, `Address: ${meta.address || "Behind Garko Motor Park, Opp. Tasidi Filling Station"}`, 0, boxY + 38, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
-      fitSingleLine(doc, `Motto: ${meta.motto || "Success comes after tears"}`, 0, boxY + 52, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
-      fitSingleLine(doc, `Phone: ${meta.phone || "08165789331, 08103992584, 08151015152"}`, 0, boxY + 66, doc.page.width, { startSize: 10, minSize: 7, font: "Helvetica", align: "center" });
+      doc.text(`Address: ${meta.address || "Behind Garko Motor Park, Opp. Tasidi Filling Station"}`, 0, boxY + 38, { align: "center" });
+      doc.text(`Motto: ${meta.motto || "Success comes after tears"}`, 0, boxY + 52, { align: "center" });
+      doc.text(`Phone: ${meta.phone || "08165789331, 08103992584, 08151015152"}`, 0, boxY + 66, { align: "center" });
 
       doc.moveTo(60, boxY + 82).lineTo(540, boxY + 82).stroke();
 
@@ -103,8 +110,8 @@ function generateClassReportPDF(meta, students, results, subjects, outPath, call
       let infoY = CONTENT_START_Y + 30;
       doc.font("Helvetica").fontSize(10);
 
-      fitSingleLine(doc, `Name: ${st.name}`, 60, infoY, 230, { startSize: 10, minSize: 7, font: "Helvetica" });
-      fitSingleLine(doc, `Class: ${meta.className}`, 60, infoY + 14, 230, { startSize: 10, minSize: 7, font: "Helvetica" });
+      doc.text(`Name: ${st.name}`, 60, infoY);
+      doc.text(`Class: ${meta.className}`, 60, infoY + 14);
       doc.text(`Admission No: ${st.id}`, 60, infoY + 28);
 
       doc.text(`Term: ${meta.term}`, 300, infoY);
@@ -151,16 +158,7 @@ function generateClassReportPDF(meta, students, results, subjects, outPath, call
     remark
   ];
 
-  const colWidths = [110, 45, 45, 45, 55, 55, 45, 45]; // matches the gaps between colX entries
-  row.forEach((v, i) => {
-    if (i === 0 || i === 7) {
-      // Subject name and Remark are the two genuinely variable-length
-      // fields here — everything else is a short number or letter grade.
-      fitSingleLine(doc, String(v), colX[i], rowY, colWidths[i], { startSize: 9, minSize: 6.5, font: "Helvetica" });
-    } else {
-      doc.text(String(v), colX[i], rowY);
-    }
-  });
+  row.forEach((v, i) => doc.text(String(v), colX[i], rowY));
   rowY += 14;
 });
 
@@ -174,35 +172,12 @@ function generateClassReportPDF(meta, students, results, subjects, outPath, call
       doc.text(`Average: ${avg}`, 380, rowY);
 
       rowY += 28;
-      const recommendation = getRecommendation(avg);
-
-      // Estimate the full remaining footer height (recommendation +
-      // gap + signature line) before drawing any of it — if it
-      // wouldn't fit on this page, start a fresh one now rather than
-      // let it silently run past the bottom border.
-      const estimatedRecHeight = measureWrappedHeight(doc, recommendation, 380, 10, "Helvetica");
-      const estimatedFooterHeight = 14 + estimatedRecHeight + Math.max(90, estimatedRecHeight + 76) + 55;
-      if (rowY + estimatedFooterHeight > FOOTER_Y - 20) {
-        doc.addPage();
-        drawHeader();
-        rowY = CONTENT_START_Y;
-      }
-
       doc.text("Teacher's Recommendation:", 60, rowY);
-      doc.font("Helvetica").text(recommendation, 60, rowY + 14, { width: 380 });
-
-      // Next Term — was previously drawn at a stray, unrelated `y`
-      // value left over from earlier in the function; now correctly
-      // positioned relative to this student's own row.
-      doc.font("Helvetica-Bold").fontSize(10).text("Next Term Begins:", 400, rowY);
-      doc.font("Helvetica").fontSize(10).text(meta.nextTermBegins || "TBA", 400, rowY + 14);
-
-      // The gap before signatures scales with how tall the
-      // recommendation actually rendered, instead of a fixed guess —
-      // a longer comment that wraps to extra lines no longer risks
-      // running into the signature block below it.
-      const recommendationHeight = measureWrappedHeight(doc, recommendation, 380, 10, "Helvetica");
-      let sigY = rowY + Math.max(90, recommendationHeight + 76);
+      doc.font("Helvetica").text(getRecommendation(avg), 60, rowY + 14, { width: 380 });
+    // Next Term
+    doc.font("Helvetica-Bold").fontSize(10).text("Next Term Begins:",400,y);
+    doc.font("Helvetica").fontSize(10).text(meta.nextTermBegins || "TBA",400,y+14);
+      let sigY = rowY + 90;
       doc.font("Helvetica-Bold");
       doc.text("Teacher's Signature:", 60, sigY);
       doc.text("Principal's Signature:", 350, sigY);
@@ -267,7 +242,7 @@ doc.font("Helvetica-Bold").fontSize(13)
 
 let sy = CONTENT_START_Y + 30;
 doc.font("Helvetica").fontSize(10);
-fitSingleLine(doc, `Class: ${meta.className}`, 60, sy, 400, { startSize: 10, minSize: 7, font: "Helvetica" });
+doc.text(`Class: ${meta.className}`, 60, sy);
 doc.text(`Term: ${meta.term}`, 60, sy + 14);
 doc.text(`Session: ${meta.session}`, 60, sy + 28);
 doc.text(`Total Students: ${meta.totalStudents}`, 60, sy + 42);
@@ -303,7 +278,7 @@ students.forEach(s => {
     rowSY = CONTENT_START_Y + 18;
   }
 
-  fitSingleLine(doc, s.name, col.n, rowSY, col.i - col.n - 6, { startSize: 10, minSize: 7, font: "Helvetica" });
+  doc.text(s.name, col.n, rowSY);
   doc.text(s.id, col.i, rowSY);
   doc.text(String(s.totalScore), col.t, rowSY);
   doc.text(s.average.toFixed(2), col.a, rowSY);
