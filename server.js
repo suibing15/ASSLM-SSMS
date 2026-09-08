@@ -347,7 +347,7 @@ const brandingUpload = multer({
 const { generateQuestionPDF } = require("./utils/questionPdfGenerator");
 const reportGuard = require("./middleware/reportGuard");
 const { readData, writeData, updateData } = require("./utils/dataStore");
-const { uploadBuffer, uploadLocalFileAndCleanup, tempPdfPath, deleteFromStorage, resolveImageForGeneration, withResolvedImages, withResolvedImagesForMany, withResolvedFieldForMany } = require("./utils/storage");
+const { uploadBuffer, uploadLocalFileAndCleanup, tempPdfPath, deleteFromStorage, storagePathFromUrl, resolveImageForGeneration, withResolvedImages, withResolvedImagesForMany, withResolvedFieldForMany } = require("./utils/storage");
 const { requireActiveSchool, startRegistryHeartbeat } = require("./utils/registryCheck");
 const { generateExamPDF, generateConsolidatedResultPDF } = require("./utils/pdfGenerator");
 const { generateReportPDF } = require("./utils/reportGenerator");
@@ -685,6 +685,15 @@ const FREEZE_ALLOWLIST = [
   "/manage",
   "/api/admin",
   "/api/system",
+  // The admin Settings page fetches /api/meta alongside /api/system/status
+  // in a single Promise.all — without this, freezing made /api/meta start
+  // returning 503, which made that whole Promise.all reject and silently
+  // discard the systemStatus() result too. That left the frontend's
+  // "locked" state stuck at false, so the unlock password field never
+  // appeared even though the freeze had genuinely worked. School branding
+  // is informational, not one of the portals freezing is meant to pause,
+  // so it stays readable regardless of lock state.
+  "/api/meta",
   "/broadcast.js",
   "/public/sounds",
   "/index.html",
@@ -780,7 +789,7 @@ app.get('/manage/admin-ui.js', requireAdmin, (req, res) => {
 app.post('/api/manage-unlock', (req, res) => {
   const { key } = req.body;
 
-  if (key === 'ASSLM') {
+  if (key === 'UBAYYU') {
     req.session.isAdmin = true;
     return res.json({ success: true });
   }
@@ -3303,10 +3312,36 @@ app.delete("/api/admin/reports/all", async (req, res) => {
   try {
     const data = readData();
     const countBefore = (data.results || []).length;
-    data.results = [];
-    await writeData(data, ['results']);
 
-    // Also clear any locally-generated report PDF files
+    // Every report sheet, consolidated summary, and exam/test receipt
+    // this school has ever generated lives in the Supabase Storage
+    // bucket, not on local disk. Previously this route only cleared
+    // the `results` table and a local "reports" folder left over from
+    // before the Storage migration (which doesn't exist on Render any
+    // more, so that part silently did nothing) — meaning every one of
+    // these files stayed in the bucket forever, orphaned, even after
+    // "clearing all report data." deleteFromStorage() already existed
+    // for exactly this but was never actually called anywhere in the
+    // app. This now genuinely removes each file before dropping its
+    // database row. A failed individual delete is logged and skipped
+    // rather than aborting the whole operation — deleteFromStorage()
+    // already swallows its own errors for this reason.
+    const reportPdfTypes = ['report_sheet', 'tests_summary', 'exam_summary', 'exam_result'];
+    const pdfsToDelete = (data.pdfs || []).filter(p => reportPdfTypes.includes(p.type));
+
+    await Promise.all(
+      pdfsToDelete.map((p) => {
+        const storagePath = storagePathFromUrl(p.filePath);
+        return storagePath ? deleteFromStorage(storagePath) : Promise.resolve();
+      })
+    );
+
+    data.results = [];
+    data.pdfs = (data.pdfs || []).filter(p => !reportPdfTypes.includes(p.type));
+    await writeData(data, ['results', 'pdfs']);
+
+    // Old local-disk cleanup kept as a harmless defensive fallback —
+    // does nothing on Render today, but costs nothing to leave in.
     const reportDir = path.join(__dirname, "reports");
     let deletedFiles = 0;
     if (fs.existsSync(reportDir)) {
@@ -3318,7 +3353,12 @@ app.delete("/api/admin/reports/all", async (req, res) => {
       });
     }
 
-    res.json({ success: true, resultsCleared: countBefore, filesDeleted: deletedFiles });
+    res.json({
+      success: true,
+      resultsCleared: countBefore,
+      pdfsDeletedFromStorage: pdfsToDelete.length,
+      filesDeleted: deletedFiles
+    });
   } catch (err) {
     console.error("Delete all reports error:", err);
     res.status(500).json({ error: "Failed to delete all report data" });
@@ -3330,8 +3370,24 @@ app.delete("/api/teacher/student/:studentId/report", async (req, res) => {
     const { studentId } = req.params;
     const data = readData();
 
-    // Delete any report PDFs belonging to this student, still on local
-    // disk for now (this will move to Storage in a later pass).
+    // Same fix as /api/admin/reports/all above — this student's report
+    // PDFs actually live in Supabase Storage, not the local disk folder
+    // this used to (and only) clean up, which meant every one of them
+    // stayed in the bucket forever after being "cleaned."
+    const reportPdfTypes = ['report_sheet', 'tests_summary', 'exam_summary', 'exam_result'];
+    const pdfsToDelete = (data.pdfs || []).filter(
+      (p) => p.studentId === studentId && reportPdfTypes.includes(p.type)
+    );
+
+    await Promise.all(
+      pdfsToDelete.map((p) => {
+        const storagePath = storagePathFromUrl(p.filePath);
+        return storagePath ? deleteFromStorage(storagePath) : Promise.resolve();
+      })
+    );
+
+    // Old local-disk cleanup kept as a harmless defensive fallback —
+    // does nothing on Render today, but costs nothing to leave in.
     const reportDir = path.join(__dirname, "reports");
     const deleted = [];
     if (fs.existsSync(reportDir)) {
@@ -3343,9 +3399,12 @@ app.delete("/api/teacher/student/:studentId/report", async (req, res) => {
       });
     }
 
-    // Clean all results for this student
+    // Clean all results and pdfs records for this student
     data.results = (data.results || []).filter((r) => r.studentId !== studentId);
-    await writeData(data, ['results']);
+    data.pdfs = (data.pdfs || []).filter(
+      (p) => !(p.studentId === studentId && reportPdfTypes.includes(p.type))
+    );
+    await writeData(data, ['results', 'pdfs']);
 
     console.log(`🧹 Cleaned old test/exam records for student ${studentId}`);
     res.json({ success: true, deleted });
@@ -3626,10 +3685,19 @@ app.get(
     const baseMeta = metaJson.meta || {};
     baseMeta.totalStudents = allStudentsInClass.length;
 
-    const teacherSigFile = path.join(__dirname, "public/uploads/teacher_signature.png");
-    if (fs.existsSync(teacherSigFile)) {
-      baseMeta.teacherSignaturePath = "/uploads/teacher_signature.png";
-    }
+    // The old check here looked for a local disk file
+    // (public/uploads/teacher_signature.png) that migration to Supabase
+    // Storage means never exists any more, and even when it did it set
+    // a field name (teacherSignaturePath) the PDF generator never
+    // actually reads (it reads teacherSignature). Net effect: the
+    // teacher's signature was never being passed into report
+    // generation at all. The real value lives on the class record
+    // itself (classEntry.teacherSignature — a Supabase Storage URL set
+    // when the teacher uploads their signature), so it's looked up
+    // there and merged into baseMeta before withResolvedImages()
+    // downloads it to a local temp file below.
+    const classEntryForSig = (data.classes || []).find(c => c.id === classId);
+    baseMeta.teacherSignature = classEntryForSig?.teacherSignature || null;
 
     const timestamp = new Date().toISOString().replace(/[:T]/g, "-").split(".")[0];
     // Reports are generated straight to Supabase Storage now (see the
@@ -3750,6 +3818,17 @@ app.get(
 // ============================================================================
 // GENERATE ONE SINGLE PDF FOR A WHOLE CLASS (ALL STUDENTS + SUMMARY PAGE)
 // ============================================================================
+//
+// The combined class report is a fully regenerable artifact — every value in
+// it is recomputed from Postgres on each request, and nothing ever fetches an
+// old copy back. So it is no longer written to Supabase Storage at all. This
+// route now just (a) fires the background per-student report-sheet sync (those
+// DO persist, because parents fetch them later) and (b) hands the frontend a
+// URL to a fresh-stream endpoint. The frontend contract is unchanged: it still
+// receives { success, file } and still does window.open(file).
+//
+// Shared calculation lives in buildCombinedReportContext() below so this route
+// and the stream route can never drift apart.
 app.get(
   "/api/teacher/class/:classId/combined-report",
   reportGuard,
@@ -3759,77 +3838,53 @@ app.get(
     const { classId } = req.params;
     const data = readData();
 
-    const students = (data.students || []).filter(s => s.classId === classId);
-    if (!students.length) {
-      return res.status(404).json({ error: "No students found." });
+    // Validate up front so the frontend still gets a clean 404/JSON error
+    // before we ever hand back a stream URL that would just fail later.
+    const ctx = buildCombinedReportContext(data, classId);
+    if (ctx.error) {
+      return res.status(ctx.status).json({ error: ctx.error });
     }
 
-    const classEntry = (data.classes || []).find(c => c.id === classId);
-    if (!classEntry) {
-      return res.status(404).json({ error: "Class not found." });
-    }
-
-    // ✅ ALWAYS resolve full subject list
-    const subjects = getClassSubjectsResolved(data, classEntry.id);
-    if (!subjects.length) {
-      return res.status(404).json({ error: "No subjects configured for this class yet." });
-    }
-    const subjectIds = subjects.map(s => s.id);
-    const subjectCount = subjects.length || 1; // prevent division by zero
-
-    // =========================
-    // CALCULATE TOTALS & RANK (MATCH REPORT SHEET LOGIC)
-    // =========================
-    students.forEach(s => {
-
-      let totalScore = 0;
-
-      subjects.forEach(sub => {
-        const r = (data.results || []).find(
-          x => x.studentId === s.id && x.subject === sub.id
-        ) || {};
-
-        totalScore +=
-          (r.test1 || 0) +
-          (r.test2 || 0) +
-          (r.test3 || 0) +
-          (r.exam  || 0);
-      });
-
-      s.totalScore = totalScore;
-      s.average = totalScore / subjectCount; // ✅ SAME AS REPORT SHEET
+    // Per-student parent-facing report sheets still persist — this calls the
+    // individual-reports route, exactly as before. Runs in the background; the
+    // admin doesn't wait on it before getting the combined-report URL back.
+    fetch(`http://localhost:${PORT}/api/teacher/class/${encodeURIComponent(classId)}/reports`).catch((syncErr) => {
+      console.error('Combined report → individual parent-portal sync error:', syncErr);
     });
 
-    students.sort((a, b) => b.average - a.average);
-
-    const suffix = n => {
-      if (n % 10 === 1 && n % 100 !== 11) return "st";
-      if (n % 10 === 2 && n % 100 !== 12) return "nd";
-      if (n % 10 === 3 && n % 100 !== 13) return "rd";
-      return "th";
-    };
-
-    students.forEach((s, i) => {
-      s.positionIndex = i + 1;
-      s.position = `${i + 1}${suffix(i + 1)}`;
+    // No upload, no pdfs row. The file is regenerated on demand by the stream
+    // route below whenever it's opened.
+    res.json({
+      success: true,
+      file: `/api/teacher/class/${encodeURIComponent(classId)}/combined-report/stream`
     });
 
-    // =========================
-    // META
-    // =========================
-    const meta = {
-      ...(data.meta || {}), // real school branding: address, motto, phone, logo, signaturePrincipal, nextTermBegins, etc.
-      schoolName: data.meta?.schoolName || "ASSALAM INTERNATIONAL ACADEMIC SCHOOL",
-      className: classId,
-      term: data.meta?.term || "Third Term",
-      session: data.meta?.session || "",
-      totalStudents: students.length
-    };
+  } catch (err) {
+    console.error("Combined report error:", err);
+    res.status(500).json({ error: "Server error." });
+  }
+});
 
-    // Generated to a temp file first (PDFKit needs a writable
-    // stream), then uploaded to Supabase Storage below. meta.logo is
-    // a Supabase Storage URL now — resolved to a local temp file
-    // first, generateClassReportPDF itself is completely unchanged.
+
+// Streams a freshly generated combined class report straight to the browser.
+// Nothing is written to Supabase Storage and no pdfs row is created — the temp
+// file is piped to the response and deleted afterward, whether the pipe
+// succeeds or fails.
+app.get(
+  "/api/teacher/class/:classId/combined-report/stream",
+  reportGuard,
+  async (req, res) => {
+
+  try {
+    const { classId } = req.params;
+    const data = readData();
+
+    const ctx = buildCombinedReportContext(data, classId);
+    if (ctx.error) {
+      return res.status(ctx.status).json({ error: ctx.error });
+    }
+    const { students, subjects, meta } = ctx;
+
     const localPath = tempPdfPath(`Class_${classId}_FULL_REPORT.pdf`);
     const logoResolved = await withResolvedImages(meta);
 
@@ -3839,50 +3894,113 @@ app.get(
       data.results || [],
       subjects,
       localPath,
-      async (err) => {
+      (err) => {
         logoResolved.cleanup();
 
         if (err) {
           console.error("PDF generation error:", err);
-          return res.status(500).json({ error: "PDF generation failed." });
+          if (!res.headersSent) res.status(500).json({ error: "PDF generation failed." });
+          fs.unlink(localPath, () => {});
+          return;
         }
 
-        let relPath;
-        try {
-          relPath = await uploadLocalFileAndCleanup(localPath, `reports/${classId}/Class_${classId}_FULL_REPORT.pdf`);
-        } catch (uploadErr) {
-          console.error("Combined report storage upload failed:", uploadErr);
-          return res.status(500).json({ error: "Failed to store the generated report." });
-        }
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader(
+          "Content-Disposition",
+          `inline; filename="Class_${classId}_FULL_REPORT.pdf"`
+        );
 
-        // Was previously registering this SAME combined, whole-class
-        // document as every student's parent-facing "report sheet" —
-        // meaning a parent would see the entire class's document, not
-        // just their own child's page. Fixed: this internally calls
-        // the individual-reports route (the same one used by the
-        // "Individual report sheets" button), which generates each
-        // student their own proper single-student PDF and registers
-        // THAT as their report sheet — completely independent of
-        // whatever this combined document looks like. Runs in the
-        // background; the admin doesn't need to wait on this before
-        // seeing the success response for the combined PDF itself.
-        fetch(`http://localhost:${PORT}/api/teacher/class/${encodeURIComponent(classId)}/reports`).catch((syncErr) => {
-          console.error('Combined report → individual parent-portal sync error:', syncErr);
+        const stream = fs.createReadStream(localPath);
+        stream.on("error", (streamErr) => {
+          console.error("Combined report stream error:", streamErr);
+          if (!res.headersSent) res.status(500).json({ error: "Failed to stream report." });
+          fs.unlink(localPath, () => {});
         });
-
-        res.json({
-          success: true,
-          file: relPath
-        });
+        // Delete the temp file once the response is fully sent (or the client
+        // disconnects) — best-effort, never blocks.
+        res.on("close", () => fs.unlink(localPath, () => {}));
+        stream.pipe(res);
       }
     );
 
   } catch (err) {
-    console.error("Combined report error:", err);
-    res.status(500).json({ error: "Server error." });
+    console.error("Combined report stream error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "Server error." });
   }
 });
 
+
+// Shared calculation for both combined-report routes above. Returns either
+// { error, status } on a validation failure, or { students, subjects, meta }
+// ready for generateClassReportPDF. Kept as one function so the JSON route and
+// the stream route always compute identical totals, ranks, and positions.
+function buildCombinedReportContext(data, classId) {
+  const students = (data.students || []).filter(s => s.classId === classId);
+  if (!students.length) {
+    return { error: "No students found.", status: 404 };
+  }
+
+  const classEntry = (data.classes || []).find(c => c.id === classId);
+  if (!classEntry) {
+    return { error: "Class not found.", status: 404 };
+  }
+
+  const subjects = getClassSubjectsResolved(data, classEntry.id);
+  if (!subjects.length) {
+    return { error: "No subjects configured for this class yet.", status: 404 };
+  }
+  const subjectCount = subjects.length || 1; // prevent division by zero
+
+  // =========================
+  // CALCULATE TOTALS & RANK (MATCH REPORT SHEET LOGIC)
+  // =========================
+  students.forEach(s => {
+    let totalScore = 0;
+    subjects.forEach(sub => {
+      const r = (data.results || []).find(
+        x => x.studentId === s.id && x.subject === sub.id
+      ) || {};
+      totalScore +=
+        (r.test1 || 0) +
+        (r.test2 || 0) +
+        (r.test3 || 0) +
+        (r.exam  || 0);
+    });
+    s.totalScore = totalScore;
+    s.average = totalScore / subjectCount; // ✅ SAME AS REPORT SHEET
+  });
+
+  students.sort((a, b) => b.average - a.average);
+
+  const suffix = n => {
+    if (n % 10 === 1 && n % 100 !== 11) return "st";
+    if (n % 10 === 2 && n % 100 !== 12) return "nd";
+    if (n % 10 === 3 && n % 100 !== 13) return "rd";
+    return "th";
+  };
+
+  students.forEach((s, i) => {
+    s.positionIndex = i + 1;
+    s.position = `${i + 1}${suffix(i + 1)}`;
+  });
+
+  const meta = {
+    ...(data.meta || {}),
+    schoolName: data.meta?.schoolName || "ASSALAM INTERNATIONAL ACADEMIC SCHOOL",
+    className: classId,
+    term: data.meta?.term || "Third Term",
+    session: data.meta?.session || "",
+    totalStudents: students.length,
+    // classEntry.teacherSignature is a Supabase Storage URL set when the
+    // teacher uploads their signature — data.meta never carries this
+    // (it's a per-class value, not a global setting), so without this
+    // it's silently missing from every combined class report, the same
+    // bug fixed for the individual per-student reports above.
+    teacherSignature: classEntry.teacherSignature || null
+  };
+
+  return { students, subjects, meta };
+}
 
 // ---------------- SIGNATURE UPLOAD ROUTES ----------------
 
@@ -4086,9 +4204,28 @@ async function regenerateConsolidatedPDF(studentId, category) {
       countedSubjects++;
     } else {
       if (r.exam === undefined) continue;
-      const examQuestions = (subj?.questions?.exam) || [];
-      const maxPossible = examQuestions.reduce((sum, q) => sum + (Number(q.marks) || 1), 0);
-      const percentage = maxPossible > 0 ? Number(((r.exam / maxPossible) * 100).toFixed(1)) : null;
+      // The real bug: this used to divide by the LIVE exam question
+      // bank's summed marks — a number that has nothing to do with
+      // the score's actual scale. r.exam is capped at submission time
+      // (see the /exam/submit route: `score = Math.min(score,
+      // SCORE_CAPS.exam)`) to SCORE_CAPS.exam, which — together with
+      // test1+test2+test3 (10+10+10) — is the school's actual 100-mark
+      // grading convention: 30% continuous assessment + 70% exam.
+      // SCORE_CAPS.exam (70) IS the exam's real, fixed full-marks
+      // value; it was never meant to be derived from how many
+      // questions currently exist or what their live marks add up to.
+      // Dividing by the live question bank instead explains both
+      // symptoms seen: whenever that live total happened to be
+      // smaller than a student's score, the result exceeded 100%
+      // (showing values like 1400%); after clamping the result to
+      // 0–100 as a stopgap, the same mismatch meant nearly every
+      // score got clamped down to a flat 100%, hiding real variation
+      // entirely. Dividing by the fixed constant instead is correct
+      // by construction and needs no clamp as a workaround — though
+      // the clamp stays in as a harmless backstop regardless.
+      const examMaxMarks = SCORE_CAPS.exam;
+      const rawPercentage = examMaxMarks > 0 ? (r.exam / examMaxMarks) * 100 : null;
+      const percentage = rawPercentage === null ? null : Number(Math.min(100, Math.max(0, rawPercentage)).toFixed(1));
       subjectRows.push({ subjectName, examScore: r.exam, percentage });
       if (percentage !== null) {
         totalSum += percentage;
@@ -4205,10 +4342,16 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
       (sum, q) => sum + (Number(q.marks) || 1),
       0
     );
-    const percentage =
-      totalPossible > 0
-        ? Number(((score / totalPossible) * 100).toFixed(2))
-        : 0;
+    // The old percentage calc used to live here, computed from the raw
+    // (not-yet-capped) score against the raw question-bank total. But
+    // a few lines below, `score` gets capped to the school's actual
+    // grading scale (SCORE_CAPS) — so that percentage was already
+    // wrong before the response was even built: it reflected a score
+    // the student's own receipt would then show as something smaller.
+    // The correct total/percentage (using the same fixed grading-scale
+    // denominator the parent-portal summary now uses) is computed
+    // further below, once the capped score is actually known — see
+    // gradedTotal/percentage after the updateData() call.
 
     // Score is saved FIRST, immediately, using the same race-free
     // update path the manual score-entry grid uses — before this fix,
@@ -4258,6 +4401,19 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
       existing.updatedAt = new Date().toISOString();
     }, ['results']); // only the results table needs re-saving here
 
+    // Computed here, AFTER score has been capped above, using the
+    // same fixed grading-scale denominator the parent-portal Exam
+    // Summary uses (SCORE_CAPS[type]) rather than the live, raw
+    // question-bank total — so the score, its "out of" total, and its
+    // percentage always agree with each other on this student's own
+    // confirmation screen, on their downloadable receipt PDF, and
+    // later on the parent portal's summary, for the exact same
+    // submission. Falls back to the raw totalPossible only for a type
+    // with no defined cap (shouldn't happen for test1/test2/test3/exam,
+    // but keeps this safe if a new type is ever added without one).
+    const gradedTotal = SCORE_CAPS[type] ?? totalPossible;
+    const percentage = gradedTotal > 0 ? Number(((score / gradedTotal) * 100).toFixed(2)) : 0;
+
     // Regenerate this student's persistent, parent-facing summary PDF
     // for whichever category this submission belongs to. Wrapped so a
     // PDF problem never takes the score down with it — the score is
@@ -4268,14 +4424,29 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
       console.error('regenerateConsolidatedPDF error:', pdfErr);
     }
 
-    const filename = `exam_${type}_${studentId}_${Date.now()}.pdf`;
+    // Filename deliberately has NO timestamp and DOES include subjectId.
+    // The old version (exam_${type}_${studentId}_${Date.now()}.pdf, no
+    // subjectId at all) meant every single sitting — every retake, of
+    // every subject — created a brand-new permanent file in Storage,
+    // with nothing anywhere in the app that ever cleaned an old one up.
+    // For a real school that's every student × every subject × every
+    // test type × every attempt, forever. Using a fixed, deterministic
+    // name per (student, subject, type) and uploading with upsert:true
+    // means a retake correctly REPLACES the previous attempt's receipt
+    // at the same path — which is also the more correct product
+    // behavior, since the current attempt is what should be on file,
+    // not a permanent stack of every past one. subjectId has to be
+    // part of the name now that it's no longer timestamp-unique,
+    // otherwise two different subjects' receipts for the same student
+    // would collide onto the same path and silently overwrite each other.
+    const filename = `exam_${type}_${subjectId}.pdf`;
     const localPath = tempPdfPath(filename);
     const examMeta = {
       type,
       subject: subj.name,
       items: itemsWithAns,
       score,
-      total: totalPossible,
+      total: gradedTotal,
       percentage,
     };
 
@@ -4296,7 +4467,7 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
         return res.json({
           success: true,
           score,
-          total: totalPossible,
+          total: gradedTotal,
           percentage,
           pdf: null,
           warning: 'Result saved, but the PDF could not be generated.',
@@ -4311,7 +4482,7 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
         return res.json({
           success: true,
           score,
-          total: totalPossible,
+          total: gradedTotal,
           percentage,
           pdf: null,
           warning: 'Result saved, but the PDF could not be stored.',
@@ -4320,21 +4491,34 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
 
       updateData((liveData) => {
         if (!liveData.pdfs) liveData.pdfs = [];
-        liveData.pdfs.push({
-          id: `pdf_${Date.now()}`,
-          type: 'exam_result',
-          studentId,
-          filePath: relPath,
-          timestamp: new Date().toISOString(),
-          subject: subj.name,
-          examType: type,
-        });
+        // Same reasoning as the storage path above: update the existing
+        // record for this exact student+subject+type instead of always
+        // pushing a new one, so the pdfs table stays bounded too and
+        // never holds a stale entry pointing at an attempt that's since
+        // been overwritten in Storage.
+        const existing = liveData.pdfs.find(
+          (p) => p.type === 'exam_result' && p.studentId === studentId && p.subject === subj.name && p.examType === type
+        );
+        if (existing) {
+          existing.filePath = relPath;
+          existing.timestamp = new Date().toISOString();
+        } else {
+          liveData.pdfs.push({
+            id: `pdf_exam_result_${studentId}_${subjectId}_${type}`,
+            type: 'exam_result',
+            studentId,
+            filePath: relPath,
+            timestamp: new Date().toISOString(),
+            subject: subj.name,
+            examType: type,
+          });
+        }
       }, ['pdfs']) // only the pdfs table needs re-saving here
         .then(() => {
           res.json({
             success: true,
             score,
-            total: totalPossible,
+            total: gradedTotal,
             percentage,
             pdf: relPath,
           });
@@ -4345,7 +4529,7 @@ app.post('/api/exam/submit', preventMultipleSubmissions, async (req, res) => {
           res.json({
             success: true,
             score,
-            total: totalPossible,
+            total: gradedTotal,
             percentage,
             pdf: relPath,
             warning: 'Result saved, but the PDF record could not be stored.',
@@ -4669,3 +4853,4 @@ for (const name of Object.keys(interfaces)) {
     }
   }
 }
+

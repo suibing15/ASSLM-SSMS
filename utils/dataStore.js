@@ -63,6 +63,38 @@ async function loadFromDatabase() {
   ]);
 
   const s = settingsRes.rows[0] || {};
+
+  // A school whose settings row was created without these keys ever
+  // being seeded ends up with portal_toggles = {} (or a partial
+  // object) in Postgres. The admin panel's "Portal Toggles" card
+  // renders one button per key in this object — with zero keys, it
+  // renders nothing at all, and looks like the card is simply broken.
+  // Defaulting every known toggle to true here, then letting whatever
+  // was actually saved override those defaults, guarantees the full
+  // set of toggle buttons always appears — for every school, including
+  // ones whose row predates a given toggle being added. Nothing here
+  // touches Postgres directly; the very next time any single toggle is
+  // flipped, writeData(['settings']) persists this complete merged
+  // object back, so the row self-heals on first use.
+  const DEFAULT_PORTAL_TOGGLES = {
+    teacherPortal: true,
+    examPortal: true,
+    reportPortal: true,
+    parentPortal: true,
+    attendancePortal: true
+  };
+  // Same problem as portalToggles above, plus a second bug on top of it:
+  // server.js's own "if empty, use defaults" checks for testToggles are
+  // written as `if (!data.meta.testToggles)`, but an empty object `{}`
+  // is truthy in JavaScript — `!{}` is `false` — so that check silently
+  // never fires for a school whose test_toggles column is NULL (which
+  // becomes `{}` via the `|| {}` below). The admin panel then receives
+  // zero keys to render, and the Test/Exam Toggles section shows
+  // nothing. Merging defaults here, the same way portalToggles is
+  // handled above, means every route that reads data.meta.testToggles
+  // always sees a fully-populated object regardless of that unrelated
+  // truthiness bug elsewhere.
+  const DEFAULT_TEST_TOGGLES = { test1: true, test2: true, test3: true, exam: true };
   const meta = {
     schoolName: s.school_name,
     address: s.address,
@@ -73,9 +105,9 @@ async function loadFromDatabase() {
     nextTermBegins: s.next_term_begins,
     logo: s.logo_path,
     signaturePrincipal: s.signature_principal_path,
-    portalToggles: s.portal_toggles || {},
+    portalToggles: { ...DEFAULT_PORTAL_TOGGLES, ...(s.portal_toggles || {}) },
     portalPasswords: s.portal_passwords || {},
-    testToggles: s.test_toggles || {},
+    testToggles: { ...DEFAULT_TEST_TOGGLES, ...(s.test_toggles || {}) },
     unlockPasswordHash: s.unlock_password_hash
   };
 

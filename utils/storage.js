@@ -16,10 +16,21 @@ const { supabase, SCHOOL_BUCKET } = require("./dataStore");
 // `storagePath` is the path *inside* the bucket, e.g. "students/0136A.jpg"
 // — organizing by folder inside the bucket, not by separate buckets,
 // keeps this simple regardless of how many categories of file exist.
-async function uploadBuffer(storagePath, buffer, contentType) {
+//
+// cacheControl defaults to '0' (no caching). Several paths in this app
+// (report sheets, class reports, summaries, signatures) are uploaded to
+// the SAME fixed storage path repeatedly with upsert:true, specifically
+// so a fresh generation replaces the old file. Supabase Storage's own
+// default cache-control (max-age=3600) meant a browser or any CDN in
+// front of it could keep serving the OLD bytes at that same URL for up
+// to an hour after the file was correctly overwritten server-side —
+// showing a teacher or parent stale scores even though the database and
+// the stored object were both already correct. cacheControl: '0' makes
+// every download revalidate against the current object instead.
+async function uploadBuffer(storagePath, buffer, contentType, cacheControl = "0") {
   const { error } = await supabase.storage
     .from(SCHOOL_BUCKET)
-    .upload(storagePath, buffer, { contentType, upsert: true });
+    .upload(storagePath, buffer, { contentType, upsert: true, cacheControl });
 
   if (error) throw new Error(`Storage upload failed for ${storagePath}: ${error.message}`);
 
@@ -36,10 +47,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-async function uploadLocalFileAndCleanup(localPath, storagePath, contentType = "application/pdf") {
+async function uploadLocalFileAndCleanup(localPath, storagePath, contentType = "application/pdf", cacheControl = "0") {
   try {
     const buffer = fs.readFileSync(localPath);
-    const url = await uploadBuffer(storagePath, buffer, contentType);
+    const url = await uploadBuffer(storagePath, buffer, contentType, cacheControl);
     return url;
   } finally {
     fs.unlink(localPath, () => {}); // best-effort cleanup, never blocks on failure
@@ -59,6 +70,22 @@ async function deleteFromStorage(storagePath) {
   } catch (err) {
     console.error(`Storage delete failed for ${storagePath} (non-critical):`, err.message);
   }
+}
+
+// Every filePath saved anywhere in this app (pdfs table entries, etc.)
+// is the FULL public URL returned by uploadBuffer() — e.g.
+// "https://xxxxx.supabase.co/storage/v1/object/public/{bucket}/reports/nur1/UB000_report.pdf"
+// — not the bucket-relative path deleteFromStorage() above actually
+// needs ("reports/nur1/UB000_report.pdf"). This pulls that relative
+// path back out. Returns null for anything that doesn't look like one
+// of this school's own Storage URLs, so a caller can safely skip it
+// rather than attempt a delete with a garbage path.
+function storagePathFromUrl(url) {
+  if (!url) return null;
+  const marker = `/object/public/${SCHOOL_BUCKET}/`;
+  const idx = url.indexOf(marker);
+  if (idx === -1) return null;
+  return url.slice(idx + marker.length);
 }
 
 // Every PDF generator (reportGenerator.js, pdfGenerator.js, etc.)
@@ -103,7 +130,7 @@ async function resolveImageForGeneration(urlOrPath) {
   return { path: localPath, cleanup: () => fs.unlink(localPath, () => {}) };
 }
 
-module.exports = { uploadBuffer, uploadLocalFileAndCleanup, tempPdfPath, deleteFromStorage, resolveImageForGeneration, withResolvedImages, withResolvedImagesForMany, withResolvedFieldForMany };
+module.exports = { uploadBuffer, uploadLocalFileAndCleanup, tempPdfPath, deleteFromStorage, storagePathFromUrl, resolveImageForGeneration, withResolvedImages, withResolvedImagesForMany, withResolvedFieldForMany };
 
 // Generic version of withResolvedImagesForMany for any field name —
 // question papers resolve each question's own "image" field, not a
@@ -122,7 +149,12 @@ async function withResolvedFieldForMany(items, fieldName) {
 async function withResolvedImagesForMany(meta, people) {
   const logo = await resolveImageForGeneration(meta?.logo);
   const signature = await resolveImageForGeneration(meta?.signaturePrincipal);
-  const resolvedMeta = meta ? { ...meta, logo: logo.path, signaturePrincipal: signature.path } : meta;
+  // meta.teacherSignature is a per-class Supabase Storage URL, same as
+  // logo/signaturePrincipal — resolved the same way so any caller that
+  // ends up drawing a teacher signature from this batch gets a real
+  // local file instead of an unresolved URL.
+  const teacherSig = await resolveImageForGeneration(meta?.teacherSignature);
+  const resolvedMeta = meta ? { ...meta, logo: logo.path, signaturePrincipal: signature.path, teacherSignature: teacherSig.path } : meta;
 
   const photoResolutions = await Promise.all(
     people.map((p) => resolveImageForGeneration(p.photo))
@@ -132,6 +164,7 @@ async function withResolvedImagesForMany(meta, people) {
   const cleanup = () => {
     logo.cleanup();
     signature.cleanup();
+    teacherSig.cleanup();
     photoResolutions.forEach((r) => r.cleanup());
   };
 
@@ -143,17 +176,26 @@ async function withResolvedImagesForMany(meta, people) {
 // student's own photo, all resolved to local temp files at once, with
 // one cleanup call afterward covering all three. Returns shallow
 // copies of `meta`/`student` — the originals passed in are untouched.
+//
+// Also resolves meta.teacherSignature when present — it's the same
+// kind of value (a Supabase Storage URL, set per-class when a teacher
+// uploads their signature) as logo/signaturePrincipal, and the report
+// generators need it downloaded to a real local file for the exact
+// same reason they need the logo downloaded: PDFKit's doc.image()
+// only accepts a local path or buffer, never a URL.
 async function withResolvedImages(meta, student = null) {
   const logo = await resolveImageForGeneration(meta?.logo);
   const signature = await resolveImageForGeneration(meta?.signaturePrincipal);
+  const teacherSig = await resolveImageForGeneration(meta?.teacherSignature);
   const photo = student ? await resolveImageForGeneration(student.photo) : { path: null, cleanup: () => {} };
 
-  const resolvedMeta = meta ? { ...meta, logo: logo.path, signaturePrincipal: signature.path } : meta;
+  const resolvedMeta = meta ? { ...meta, logo: logo.path, signaturePrincipal: signature.path, teacherSignature: teacherSig.path } : meta;
   const resolvedStudent = student ? { ...student, photo: photo.path } : student;
 
   const cleanup = () => {
     logo.cleanup();
     signature.cleanup();
+    teacherSig.cleanup();
     photo.cleanup();
   };
 
